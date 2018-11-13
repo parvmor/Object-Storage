@@ -45,7 +45,7 @@ struct table {
     int size;
     int num_elems;
     chain* array;
-    ht_key (*elem_key)(ht_elem e);
+    ht_key (*elem_key)(struct objfs_state *objfs, ht_elem e);
     bool (*equal)(ht_key k1, ht_key k2);
     int (*hash)(ht_key k, int m);
 };
@@ -55,11 +55,11 @@ struct list {
     struct list* next;
 };
 
-void list_free(list p, void (*elem_free)(ht_elem e)) {
+void list_free(struct objfs_state *objfs, list p, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
     list q;
     while (p != NULL) {
         if (p->data != NULL && elem_free != NULL) {
-            (*elem_free)(p->data);
+            (*elem_free)(objfs, p->data);
         }
         q = p->next;
         free(p);
@@ -68,9 +68,9 @@ void list_free(list p, void (*elem_free)(ht_elem e)) {
 }
 
 chain chain_new();
-ht_elem chain_insert(table H, chain C, ht_elem e);
-ht_elem chain_search(table H, chain C, ht_key k);
-void chain_free(chain C, void (*elem_free)(ht_elem e));
+ht_elem chain_insert(struct objfs_state *objfs, table H, chain C, ht_elem e);
+ht_elem chain_search(struct objfs_state *objfs, table H, chain C, ht_key k);
+void chain_free(struct objfs_state *objfs, chain C, void (*elem_free)(struct objfs_state *objfs, ht_elem e));
 
 struct chain {
     list list;
@@ -87,11 +87,11 @@ chain chain_new() {
     return C;
 }
 
-list chain_find(table H, chain C, ht_key k) {
+list chain_find(struct objfs_state *objfs, table H, chain C, ht_key k) {
     ASSERT(is_chain(C));
     list p = C->list;
     while (p != NULL) {
-        if ((*H->equal)(k, (*H->elem_key)(p->data))) {
+        if ((*H->equal)(k, (*H->elem_key)(objfs, p->data))) {
             return p;
         }
         p = p->next;
@@ -99,9 +99,31 @@ list chain_find(table H, chain C, ht_key k) {
     return NULL;
 }
 
-ht_elem chain_insert(table H, chain C, ht_elem e) {
+void chain_delete(struct objfs_state *objfs, table H, chain C, ht_elem e, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
+    ASSERT(is_chain(C));
+    list p = C->list;
+    list old_p;
+    if (p != NULL && p->data == e) {
+        C->list = p->next;
+        (*elem_free)(objfs, p->data);
+        free(p);
+        return;
+    }
+    while (p != NULL && p->data != e) {
+        old_p = p;
+        p = p->next;
+    }
+    if (p == NULL) { // Key not present
+        return;
+    }
+    old_p->next = p->next;
+    (*elem_free)(objfs, p->data);
+    free(p);
+}
+
+ht_elem chain_insert(struct objfs_state *objfs, table H, chain C, ht_elem e) {
     ASSERT(is_chain(C) && e != NULL);
-    list p = chain_find(H, C, (*H->elem_key)(e));
+    list p = chain_find(objfs, H, C, (*H->elem_key)(objfs, e));
     if (p == NULL) {
         list new_item = xmalloc(sizeof(struct list));
         new_item->data = e;
@@ -117,9 +139,9 @@ ht_elem chain_insert(table H, chain C, ht_elem e) {
     }
 }
 
-ht_elem chain_search(table H, chain C, ht_key k) {
+ht_elem chain_search(struct objfs_state *objfs, table H, chain C, ht_key k) {
     ASSERT(is_chain(C));
-    list p = chain_find(H, C, k);
+    list p = chain_find(objfs, H, C, k);
     if (p == NULL) {
         return NULL;
     } else {
@@ -127,13 +149,13 @@ ht_elem chain_search(table H, chain C, ht_key k) {
     }
 }
 
-void chain_free(chain C, void (*elem_free)(ht_elem e)) {
+void chain_free(struct objfs_state *objfs, chain C, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
     ASSERT(is_chain(C));
-    list_free(C->list, elem_free);
+    list_free(objfs, C->list, elem_free);
     free(C);
 }
 
-bool is_h_chain (table H, chain C, int h, int m) {
+bool is_h_chain (struct objfs_state *objfs, table H, chain C, int h, int m) {
     ASSERT(0 <= h && h < m);
     if (C == NULL) {
         return false;
@@ -143,7 +165,7 @@ bool is_h_chain (table H, chain C, int h, int m) {
         if (p->data == NULL) {
             return false;
         }
-        if ((*H->hash)((*H->elem_key)(p->data), m) != h) {
+        if ((*H->hash)((*H->elem_key)(objfs, p->data), m) != h) {
             return false;
         }
         p = p->next;
@@ -151,7 +173,7 @@ bool is_h_chain (table H, chain C, int h, int m) {
     return true;
 }
 
-bool is_table(table H) {
+bool is_table(struct objfs_state *objfs, table H) {
     int i; int m;
     if (H == NULL) {
         return false;
@@ -159,7 +181,7 @@ bool is_table(table H) {
     m = H->size;
     for (i = 0; i < m; i++) {
         chain C = H->array[i];
-        if (!(C == NULL || is_h_chain(H, C, i, m))) {
+        if (!(C == NULL || is_h_chain(objfs, H, C, i, m))) {
             return false;
         }
     }
@@ -167,8 +189,9 @@ bool is_table(table H) {
 }
 
 table table_new(
+        struct objfs_state *objfs,
         int init_size,
-        ht_key (*elem_key)(ht_elem e),
+        ht_key (*elem_key)(struct objfs_state *objfs, ht_elem e),
         bool (*equal)(ht_key k1, ht_key k2),
         int (*hash)(ht_key k, int m)) {
     ASSERT(init_size > 1);
@@ -180,45 +203,58 @@ table table_new(
     H->elem_key = elem_key;
     H->equal = equal;
     H->hash = hash;
-    ASSERT(is_table(H));
+    ASSERT(is_table(objfs, H));
     return H;
 }
 
-ht_elem table_search(table H, ht_key k) {
-    ASSERT(is_table(H));
+ht_elem table_search(struct objfs_state *objfs, table H, ht_key k) {
+    ASSERT(is_table(objfs, H));
     int h = (*H->hash)(k, H->size);
     if (H->array[h] == NULL) {
         return NULL;
     }
-    ht_elem e = chain_search(H, H->array[h], k);
-    ASSERT(e == NULL || (*H->equal)((*H->elem_key)(e), k));
+    ht_elem e = chain_search(objfs, H, H->array[h], k);
+    ASSERT(e == NULL || (*H->equal)((*H->elem_key)(objfs, e), k));
     return e;
 }
 
-ht_elem table_insert(table H, ht_elem e) {
-    ASSERT(is_table(H));
+ht_elem table_insert(struct objfs_state *objfs, table H, ht_elem e) {
+    ASSERT(is_table(objfs, H));
     ht_elem old_e;
-    ht_key k = (*H->elem_key)(e);
+    ht_key k = (*H->elem_key)(objfs, e);
     int h = (*H->hash)(k, H->size);
     if (H->array[h] == NULL) {
         H->array[h] = chain_new();
     }
-    old_e = chain_insert(H, H->array[h], e);
+    old_e = chain_insert(objfs, H, H->array[h], e);
     if (old_e != NULL) {
         return old_e;
     }
     H->num_elems++;
-    ASSERT(is_table(H));
-    ASSERT(table_search(H, (*H->elem_key)(e)) == e);
+    ASSERT(is_table(objfs, H));
+    ASSERT(table_search(objfs, H, (*H->elem_key)(objfs, e)) == e);
     return NULL;
 }
 
-void table_free(table H, void (*elem_free)(ht_elem e)) {
-    ASSERT(is_table(H));
+void table_delete(struct objfs_state *objfs, table H, ht_elem e, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
+    ASSERT(is_table(objfs, H));
+    ASSERT(table_search(objfs, H, (*H->elem_key)(objfs, e)) == e);
+    ht_key k = (*H->elem_key)(objfs, e);
+    int h = (*H->hash)(k, H->size);
+    ASSERT(H->array[h] != NULL);
+    chain_delete(objfs, H, H->array[h], e, elem_free);
+    H->num_elems--;
+    ASSERT(is_table(objfs, H));
+}
+
+void table_free(struct objfs_state *objfs, table H, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
+    ASSERT(is_table(objfs, H));
     int i;
     for (i = 0; i < H->size; i++) {
         chain C = H->array[i];
-        if (C != NULL) chain_free(C, elem_free);
+        if (C != NULL) {
+            chain_free(objfs, C, elem_free);
+        }
     }
     free(H->array);
     free(H);
@@ -226,66 +262,74 @@ void table_free(table H, void (*elem_free)(ht_elem e)) {
 // End Hash Table Implementation
 #endif
 
-#ifndef __BITSET_H__
-#define __BITSET_H__
+#ifndef __BITMAP_H__
+#define __BITMAP_H__
 // This implementation is inspired from here:
 // https://github.com/lemire/cbitset
 
-// Start Bitset Implementation
-struct bitset_t {
+// Start Bitmap Implementation
+struct bitmap_t {
     uint64_t* array;
     size_t arraysize;
 };
-typedef struct bitset_t* bitset_t;
+typedef struct bitmap_t* bitmap_t;
 
-bitset_t bitset_create(size_t size) {
-    bitset_t bitset = NULL;
-    bitset = xmalloc(sizeof(struct bitset_t));
-    bitset->arraysize = (size + sizeof(uint64_t) * 8 - 1) / (sizeof(uint64_t) * 8);
-    bitset->array = xcalloc(bitset->arraysize, sizeof(uint64_t));
-    return bitset;
+bitmap_t bitmap_create(size_t size) {
+    bitmap_t bitmap = NULL;
+    bitmap = xmalloc(sizeof(struct bitmap_t));
+    bitmap->arraysize = (size + sizeof(uint64_t) * 8 - 1) / (sizeof(uint64_t) * 8);
+    bitmap->array = xcalloc(bitmap->arraysize, sizeof(uint64_t));
+    return bitmap;
 }
 
-static inline void bitset_set_block(bitset_t bitset, size_t shiftedi, uint64_t value) {
-    bitset->array[shiftedi] = value;
+static inline size_t bitmap_size(const bitmap_t bitmap) {
+    return bitmap->arraysize;
 }
 
-static inline void bitset_set(bitset_t bitset, size_t i) {
+static inline void bitmap_set_block(bitmap_t bitmap, size_t shiftedi, uint64_t value) {
+    bitmap->array[shiftedi] = value;
+}
+
+static inline uint64_t bitmap_get_block(const bitmap_t bitmap, size_t shiftedi) {
+    return bitmap->array[shiftedi];
+}
+
+static inline void bitmap_set(bitmap_t bitmap, size_t i) {
     size_t shiftedi = i >> 6;
-    bitset->array[shiftedi] |= ((uint64_t)1) << (i % 64);
+    bitmap->array[shiftedi] |= ((uint64_t)1) << (i % 64);
 }
 
-static inline void bitset_clear(bitset_t bitset, size_t i) {
+static inline void bitmap_clear(bitmap_t bitmap, size_t i) {
     size_t shiftedi = i >> 6;
-    bitset->array[shiftedi] &= (~(((uint64_t)1) << (i % 64)));
+    bitmap->array[shiftedi] &= (~(((uint64_t)1) << (i % 64)));
 }
 
-static inline bool bitset_get(const bitset_t bitset, size_t i) {
+static inline bool bitmap_get(const bitmap_t bitmap, size_t i) {
     size_t shiftedi = i >> 6;
-    if (shiftedi >= bitset->arraysize) {
+    if (shiftedi >= bitmap->arraysize) {
         return false;
     }
-    return (bitset->array[shiftedi] & (((uint64_t)1) << (i % 64))) != 0;
+    return (bitmap->array[shiftedi] & (((uint64_t)1) << (i % 64))) != 0;
 }
 
-size_t bitset_minimum(const bitset_t bitset) {
-    for (size_t i = 0; i < bitset->arraysize; i++) {
-        uint64_t w = ~(bitset->array[i]);
+size_t bitmap_minimum(const bitmap_t bitmap) {
+    for (size_t i = 0; i < bitmap->arraysize; i++) {
+        uint64_t w = ~(bitmap->array[i]);
         if (w != 0) {
             return __builtin_ctzll(w) + i * 64;
         }
     }
     return 0;
 }
-// End Bitset Implementation
+// End bitmap Implementation
 #endif
 
 #define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
 #define KEY_LEN (32) // 256 bit keys
-#define BLOCK_SIZE (4096) // 4KB
 #define MAX_BLOCKS (8 * 1024 * 1024) // 32GB / 4KB ==> 8 * 2^20
 #define DIR_PTR (12) // 12 direct pointers
 #define S_INDIR_PTR (4) // 4 single indirect pointers
+#define OBJECT_SIZE (128) // 128 bytes
 
 #define malloc_4k(x) do{\
     (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
@@ -299,18 +343,26 @@ typedef struct object* object;
 struct object {
     uint32_t id;
     uint32_t size;
+    uint32_t cache_index;
+    uint32_t cache_dirty;
     char key[KEY_LEN];
     uint32_t dir_ptr[DIR_PTR];
     uint32_t s_indir_ptr[S_INDIR_PTR];
+    // Align the object struct to 128 bytes
+    uint64_t pad[2];
 };
 
-bool equal(ht_key s1, ht_key s2) {
-    return !strcmp((char*)s1, (char*)s2);
-}
+table objid_table;
+bitmap_t block_bitmap;
+bitmap_t inode_bitmap;
 
-ht_key elem_key(ht_elem e) {
-    ASSERT(e != NULL);
-    return ((object)e)->key;
+bool equal(ht_key s1, ht_key s2) {
+    for (size_t i = 0; i < KEY_LEN; i++) {
+        if (*(((char*)s1) + i) != *(((char*)s2) + i)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 int hash(ht_key s, int m) {
@@ -333,14 +385,96 @@ int hash(ht_key s, int m) {
     return hx;
 }
 
-void elem_free(ht_elem e) {
+void elem_free(struct objfs_state *objfs, ht_elem e) {
     free(e);
 }
 
-object objs;
-table obj_table;
-bitmap_t block_bitmap;
-bitmap_t inode_bitmap;
+static object get_object(struct objfs_state *objfs, uint32_t objid) {
+    size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
+    size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
+    // objid = x * inodes_per_blocks + y
+    size_t x = objid / inodes_per_block;
+    size_t y = objid - x * inodes_per_block;
+
+    object objs, obj;
+    malloc_4k(objs);
+    if (!objs) {
+        dprintf("%s: malloc_4k failed\n", __func__);
+    }
+
+    if (read_block(objfs, x + start_block, (void*)objs) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        return NULL;
+    }
+    if ((objs + y)->id != objid) {
+        dprintf("%s: given objid does not matched with the one stored at inode table\n", __func__);
+        dprintf("%s: obj->id = %d and objid = %d\n", __func__, (objs + y)->id, objid);
+        return NULL;
+    }
+    obj = malloc(OBJECT_SIZE);
+    memcpy(obj, objs + y, OBJECT_SIZE);
+    free_4k(objs);
+    return obj;
+}
+
+ht_key elem_key(struct objfs_state *objfs, ht_elem e) {
+    ASSERT(e != NULL);
+    return get_object(objfs, *((uint32_t*)e))->key;
+}
+
+static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize, struct objfs_state *objfs) {
+    dprintf("%s: start\n", __func__);
+    char *ptr;
+    malloc_4k(ptr);
+    if (!ptr) {
+        dprintf("%s: malloc_4k failed\n", __func__);
+        return -1;
+    }
+
+    bitmap = bitmap_create(bitsize);
+    size_t end_block = start_block + bitsize / (8 * BLOCK_SIZE);
+    for (size_t i = start_block; i < end_block; i++) {
+        if (read_block(objfs, i, ptr) < 0) {
+            return -1;
+        }
+        size_t off = 0;
+        while (off < BLOCK_SIZE) {
+            bitmap_set_block(bitmap, off + (i - start_block) * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
+            off += sizeof(uint64_t);
+        }
+    }
+
+    free_4k(ptr);
+    dprintf("%s: end\n", __func__);
+    return 0;
+}
+
+static int destroy_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize, struct objfs_state *objfs) {
+    dprintf("%s: start\n", __func__);
+    char *ptr;
+    malloc_4k(ptr);
+    if (!ptr) {
+        dprintf("%s: malloc_4k failed\n", __func__);
+        return -1;
+    }
+
+    ASSERT(bitmap_size(bitmap) == (bitsize + sizeof(uint64_t) * 8 - 1) / (sizeof(uint64_t) * 8));
+    size_t end_block = start_block + bitsize / (8 * BLOCK_SIZE);
+    for (size_t i = start_block; i < end_block; i++) {
+        size_t off = 0;
+        while (off < BLOCK_SIZE) {
+            *((uint64_t*)ptr + off) = bitmap_get_block(bitmap, off + (i - start_block) * BLOCK_SIZE);
+            off += sizeof(uint64_t);
+        }
+        if (write_block(objfs, i, ptr) < 0) {
+            return -1;
+        }
+    }
+
+    free_4k(ptr);
+    dprintf("%s: end\n", __func__);
+    return 0;
+}
 
 static int find_and_read(struct objfs_state *objfs, struct object *obj, char *user_buf, int size) {
     return 0;
@@ -407,72 +541,78 @@ int fillup_size_details(struct stat *buf) {
     return 0;
 }
 
+int init_hash_table(struct objfs_state *objfs) {
+    object objs;
+    malloc_4k(objs);
+    if (!objs) {
+        dprintf("%s: malloc_4k failed\n", __func__);
+    }
+
+    objid_table = table_new(objfs, MAX_OBJS, &elem_key, &equal, &hash);
+    size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
+    size_t end_block = start_block + (MAX_OBJS * OBJECT_SIZE) / (BLOCK_SIZE);
+    for (size_t i = start_block; i < end_block; i++) {
+        if (read_block(objfs, i, (void*)objs) < 0) {
+            return -1;
+        }
+        size_t off = 0;
+        while (off < BLOCK_SIZE) {
+            object obj = objs + off / OBJECT_SIZE;
+            if (obj->id == 0) {
+                continue;
+            }
+            uint32_t *id = xmalloc(sizeof(uint32_t));
+            *id = obj->id;
+            table_insert(objfs, objid_table, id);
+            ASSERT(*((uint32_t*)table_search(objfs, objid_table, obj->key)) == obj->id);
+            off += OBJECT_SIZE;
+        }
+    }
+
+    free_4k(objs);
+    return 0;
+}
+
+void destroy_hash_table(struct objfs_state *objfs) {
+    table_free(objfs, objid_table, &elem_free);
+    return;
+}
+
 // Set your private pointer, anyway you like.
 int objstore_init(struct objfs_state *objfs) {
-    char *ptr;
-    malloc_4k(ptr); // reading from read_block requires 4k aligned buf.
-    if (!ptr) {
-        dprintf("%s: malloc_4k error\n", __func__);
+    if (sizeof(struct object) != OBJECT_SIZE) {
+        dprintf("%s: object structure is not of 128 bytes\n", __func__);
         return -1;
     }
-
     // read the inode bitmap
-    inode_bitmap = bitset_create(MAX_OBJS);
-    size_t inodes = MAX_OBJS / (8 * BLOCK_SIZE); // Total bits / 8 / BLOCK_SIZE
-    for (size_t i = 0; i < inodes; i++) {
-        if (read_block(objfs, i, ptr) < 0) {
-            return -1;
-        }
-        size_t off = 0;
-        while (off < BLOCK_SIZE) {
-            bitset_set_block(inode_bitmap, off + i * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
-            off += sizeof(uint64_t); // move by 64 bits
-        }
+    if (init_bitmap(inode_bitmap, 0, MAX_OBJS, objfs) < 0) {
+        return -1;
     }
     // read the block bitmap
-    block_bitmap = bitset_create(MAX_BLOCKS);
-    size_t blocks = MAX_BLOCKS / (8 * BLOCK_SIZE);
-    for (size_t i = 0; i < blocks; i++) {
-        if (read_block(objfs, inodes + i, ptr) < 0) {
-            return -1;
-        }
-        size_t off = 0;
-        while (off < BLOCK_SIZE) {
-            bitset_set_block(block_bitmap, off + i * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
-            off += sizeof(uint64_t); // move by 64 bits
-        }
-    }
-    // read the inode table and initialize the hash table
-    blocks += inodes;
-    obj_table = table_new(MAX_OBJS, &elem_key, &equal, &hash);
-    size_t objects = (MAX_OBJS * sizeof(struct object)) / (BLOCK_SIZE);
-    if (read_block(objfs, blocks, ptr) < 0) {
+    if (init_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS, objfs) < 0) {
         return -1;
     }
-    blocks += 1;
-    size_t current_objs = *((uint32_t*)ptr);
-    ASSERT(current_objs <= MAX_OBJS);
-    malloc_4k()
-    size_t off = sizeof(struct object);
-    while (current_objs > 0) {
-        if (off >= BLOCK_SIZE) {
-            if (read_block(objfs, blocks, ptr) < 0) {
-                return -1;
-            }
-            blocks += 1;
-            off = 0;
-        }
-
-        off += sizeof(struct object);
-        current_objs -= 1;
+    // read the hash table
+    if (init_hash_table(objfs) < 0) {
+        return -1;
     }
-
-    free_4k(ptr);
     dprintf("Objstore init completed successfully!\n");
     return 0;
 }
 
 // Cleanup private data. FS is being unmounted
 int objstore_destroy(struct objfs_state *objfs) {
+    // destroy the inode bitmap
+    if (destroy_bitmap(inode_bitmap, 0, MAX_OBJS, objfs) < 0) {
+        return -1;
+    }
+    // destroy the block bitmap
+    if (destroy_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS, objfs) < 0) {
+        return -1;
+    }
+    // destroy the hash table
+    destroy_hash_table(objfs);
+
+    dprintf("Objstore destroy completed successfully!\n");
     return 0;
 }
