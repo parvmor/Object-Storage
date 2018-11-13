@@ -246,6 +246,10 @@ bitset_t bitset_create(size_t size) {
     return bitset;
 }
 
+static inline void bitset_set_block(bitset_t bitset, size_t shiftedi, uint64_t value) {
+    bitset->array[shiftedi] = value;
+}
+
 static inline void bitset_set(bitset_t bitset, size_t i) {
     size_t shiftedi = i >> 6;
     bitset->array[shiftedi] |= ((uint64_t)1) << (i % 64);
@@ -273,19 +277,31 @@ size_t bitset_minimum(const bitset_t bitset) {
     }
     return 0;
 }
-
 // End Bitset Implementation
 #endif
 
-#define MAX_OBJS 1000000
-#define OBJ_SIZE (16 * 1024 * 1024) // bytes
-#define KEY_LEN 32 // bytes
+#define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
+#define KEY_LEN (32) // 256 bit keys
+#define BLOCK_SIZE (4096) // 4KB
+#define MAX_BLOCKS (8 * 1024 * 1024) // 32GB / 4KB ==> 8 * 2^20
+#define DIR_PTR (12) // 12 direct pointers
+#define S_INDIR_PTR (4) // 4 single indirect pointers
+
+#define malloc_4k(x) do{\
+    (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
+    if ((x) == MAP_FAILED)\
+        (x) = NULL;\
+} while(0)
+
+#define free_4k(x) munmap((x), BLOCK_SIZE)
 
 typedef struct object* object;
 struct object {
-    long id;
-    long size;
+    uint32_t id;
+    uint32_t size;
     char key[KEY_LEN];
+    uint32_t dir_ptr[DIR_PTR];
+    uint32_t s_indir_ptr[S_INDIR_PTR];
 };
 
 bool equal(ht_key s1, ht_key s2) {
@@ -318,19 +334,13 @@ int hash(ht_key s, int m) {
 }
 
 void elem_free(ht_elem e) {
-    free(((object)e)->key);
     free(e);
 }
 
-object obj;
-
-#define malloc_4k(x) do{\
-    (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
-    if ((x) == MAP_FAILED)\
-        (x) = NULL;\
-} while(0)
-
-#define free_4k(x) munmap((x), BLOCK_SIZE)
+object objs;
+table obj_table;
+bitmap_t block_bitmap;
+bitmap_t inode_bitmap;
 
 static int find_and_read(struct objfs_state *objfs, struct object *obj, char *user_buf, int size) {
     return 0;
@@ -399,6 +409,66 @@ int fillup_size_details(struct stat *buf) {
 
 // Set your private pointer, anyway you like.
 int objstore_init(struct objfs_state *objfs) {
+    char *ptr;
+    malloc_4k(ptr); // reading from read_block requires 4k aligned buf.
+    if (!ptr) {
+        dprintf("%s: malloc_4k error\n", __func__);
+        return -1;
+    }
+
+    // read the inode bitmap
+    inode_bitmap = bitset_create(MAX_OBJS);
+    size_t inodes = MAX_OBJS / (8 * BLOCK_SIZE); // Total bits / 8 / BLOCK_SIZE
+    for (size_t i = 0; i < inodes; i++) {
+        if (read_block(objfs, i, ptr) < 0) {
+            return -1;
+        }
+        size_t off = 0;
+        while (off < BLOCK_SIZE) {
+            bitset_set_block(inode_bitmap, off + i * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
+            off += sizeof(uint64_t); // move by 64 bits
+        }
+    }
+    // read the block bitmap
+    block_bitmap = bitset_create(MAX_BLOCKS);
+    size_t blocks = MAX_BLOCKS / (8 * BLOCK_SIZE);
+    for (size_t i = 0; i < blocks; i++) {
+        if (read_block(objfs, inodes + i, ptr) < 0) {
+            return -1;
+        }
+        size_t off = 0;
+        while (off < BLOCK_SIZE) {
+            bitset_set_block(block_bitmap, off + i * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
+            off += sizeof(uint64_t); // move by 64 bits
+        }
+    }
+    // read the inode table and initialize the hash table
+    blocks += inodes;
+    obj_table = table_new(MAX_OBJS, &elem_key, &equal, &hash);
+    size_t objects = (MAX_OBJS * sizeof(struct object)) / (BLOCK_SIZE);
+    if (read_block(objfs, blocks, ptr) < 0) {
+        return -1;
+    }
+    blocks += 1;
+    size_t current_objs = *((uint32_t*)ptr);
+    ASSERT(current_objs <= MAX_OBJS);
+    malloc_4k()
+    size_t off = sizeof(struct object);
+    while (current_objs > 0) {
+        if (off >= BLOCK_SIZE) {
+            if (read_block(objfs, blocks, ptr) < 0) {
+                return -1;
+            }
+            blocks += 1;
+            off = 0;
+        }
+
+        off += sizeof(struct object);
+        current_objs -= 1;
+    }
+
+    free_4k(ptr);
+    dprintf("Objstore init completed successfully!\n");
     return 0;
 }
 
