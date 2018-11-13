@@ -2,37 +2,46 @@
 #include "lib.h"
 #include "stdbool.h"
 
-#ifdef DBG
-#include "assert.h"
+#define malloc_4k(x, ret) do{\
+    (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
+    if ((x) == MAP_FAILED) {\
+        dprintf("%s: malloc_4k failed\n", __func__);\
+        return (ret);
+    }\
+} while(0)
 
-#define ASSERT(COND) assert(COND)
+#define xcalloc(x, ret, nobj, size) do {\
+    (x) = calloc((nobj), (size));\
+    if ((x) == NULL) {\
+        dprintf("%s: xcalloc failed with nobj = %ld and size = %ld\n", __func__, (nobj), (size));\
+        return (ret);\
+    }\
+} while(0)
 
-#else
+#define xmalloc(x, ret, size) do {\
+    (x) = malloc((size));\
+    if ((x) == NULL) {\
+        dprintf("%s: xmalloc failed with size = %ld\n", __func__, (size));\
+        return (ret);\
+    }\
+} while(0)
 
-#define ASSERT(COND) ((void)0)
+#define xfree(x) free((x))
+#define free_4k(x) munmap((x), BLOCK_SIZE)
+#define KEY_LEN (32) // 256 bit keys
+#define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
+#define MAX_BLOCKS (8 * 1024 * 1024) // 32GB / 4KB ==> 8 * 2^20
+#define DIR_PTR (12) // 12 direct pointers
+#define S_INDIR_PTR (4) // 4 single indirect pointers
+#define OBJECT_SIZE (128) // 128 bytes
 
-#endif
+typedef struct objfs_state* objfs_state;
+static objfs_state objfs;
 
 #ifndef __HASH_TABLE_H__
 #define __HASH_TABLE_H__
 // This implementation is taken from here:
 // https://www.cs.cmu.edu/~fp/courses/15122-f10/lectures/22-mem/
-
-// Start Memory Allocation Utilities
-void* xcalloc(size_t nobj, size_t size) {
-    void* p = calloc(nobj, size);
-    if (p == NULL) {
-    }
-    return p;
-}
-
-void* xmalloc(size_t size) {
-    void* p = malloc(size);
-    if (p == NULL) {
-    }
-    return p;
-}
-// End Memory Allocation Utilities
 
 // Start Hash Table Implementation
 typedef void* ht_key;
@@ -45,7 +54,7 @@ struct table {
     int size;
     int num_elems;
     chain* array;
-    ht_key (*elem_key)(struct objfs_state *objfs, ht_elem e);
+    ht_key (*elem_key)(ht_elem e);
     bool (*equal)(ht_key k1, ht_key k2);
     int (*hash)(ht_key k, int m);
 };
@@ -55,92 +64,83 @@ struct list {
     struct list* next;
 };
 
-void list_free(struct objfs_state *objfs, list p, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
+void list_free(list p, void (*elem_free)(ht_elem e)) {
     list q;
     while (p != NULL) {
         if (p->data != NULL && elem_free != NULL) {
-            (*elem_free)(objfs, p->data);
+            (*elem_free)(p->data);
         }
         q = p->next;
-        free(p);
+        xfree(p);
         p = q;
     }
 }
-
-chain chain_new();
-ht_elem chain_insert(struct objfs_state *objfs, table H, chain C, ht_elem e);
-ht_elem chain_search(struct objfs_state *objfs, table H, chain C, ht_key k);
-void chain_free(struct objfs_state *objfs, chain C, void (*elem_free)(struct objfs_state *objfs, ht_elem e));
 
 struct chain {
     list list;
 };
 
-bool is_chain(chain C) {
-  return C != NULL;
-}
-
 chain chain_new() {
-    chain C = xmalloc(sizeof(struct chain));
+    chain C;
+    xmalloc(C, NULL, sizeof(struct chain));
     C->list = NULL;
-    ASSERT(is_chain(C));
     return C;
 }
 
-list chain_find(struct objfs_state *objfs, table H, chain C, ht_key k) {
-    ASSERT(is_chain(C));
+list chain_find(table H, chain C, ht_key k) {
     list p = C->list;
     while (p != NULL) {
-        if ((*H->equal)(k, (*H->elem_key)(objfs, p->data))) {
+        ht_key k_prime = (*H->elem_key)(p->data);
+        if ((*H->equal)(k, k_prime)) {
+            xfree(k_prime);
             return p;
         }
+        xfree(k_prime);
         p = p->next;
     }
     return NULL;
 }
 
-void chain_delete(struct objfs_state *objfs, table H, chain C, ht_elem e, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
-    ASSERT(is_chain(C));
+void chain_delete(table H, chain C, ht_elem e, void (*elem_free)(ht_elem e)) {
     list p = C->list;
     list old_p;
     if (p != NULL && p->data == e) {
         C->list = p->next;
-        (*elem_free)(objfs, p->data);
-        free(p);
+        (*elem_free)(p->data);
+        xfree(p);
         return;
     }
     while (p != NULL && p->data != e) {
         old_p = p;
         p = p->next;
     }
-    if (p == NULL) { // Key not present
+    if (p == NULL) {
         return;
     }
     old_p->next = p->next;
-    (*elem_free)(objfs, p->data);
-    free(p);
+    (*elem_free)(p->data);
+    xfree(p);
 }
 
-ht_elem chain_insert(struct objfs_state *objfs, table H, chain C, ht_elem e) {
-    ASSERT(is_chain(C) && e != NULL);
-    list p = chain_find(objfs, H, C, (*H->elem_key)(objfs, e));
+ht_elem chain_insert(table H, chain C, ht_elem e) {
+    ht_key k = (*H->elem_key)(e);
+    list p = chain_find(H, C, k);
+    xfree(k);
     if (p == NULL) {
-        list new_item = xmalloc(sizeof(struct list));
+        list new_item;
+        xmalloc(new_item, NULL, sizeof(struct list));
         new_item->data = e;
         new_item->next = C->list;
         C->list = new_item;
-        ASSERT(is_chain(C));
         return NULL;
     } else {
         ht_elem old_e = p->data;
         p->data = e;
-        ASSERT(is_chain(C));
         return old_e;
     }
 }
 
-ht_elem chain_search(struct objfs_state *objfs, table H, chain C, ht_key k) {
-    ASSERT(is_chain(C));
+ht_elem chain_search(table H, chain C, ht_key k) {
     list p = chain_find(objfs, H, C, k);
     if (p == NULL) {
         return NULL;
@@ -149,115 +149,69 @@ ht_elem chain_search(struct objfs_state *objfs, table H, chain C, ht_key k) {
     }
 }
 
-void chain_free(struct objfs_state *objfs, chain C, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
-    ASSERT(is_chain(C));
-    list_free(objfs, C->list, elem_free);
-    free(C);
-}
-
-bool is_h_chain (struct objfs_state *objfs, table H, chain C, int h, int m) {
-    ASSERT(0 <= h && h < m);
-    if (C == NULL) {
-        return false;
-    }
-    list p = C->list;
-    while (p != NULL) {
-        if (p->data == NULL) {
-            return false;
-        }
-        if ((*H->hash)((*H->elem_key)(objfs, p->data), m) != h) {
-            return false;
-        }
-        p = p->next;
-    }
-    return true;
-}
-
-bool is_table(struct objfs_state *objfs, table H) {
-    int i; int m;
-    if (H == NULL) {
-        return false;
-    }
-    m = H->size;
-    for (i = 0; i < m; i++) {
-        chain C = H->array[i];
-        if (!(C == NULL || is_h_chain(objfs, H, C, i, m))) {
-            return false;
-        }
-    }
-    return true;
+void chain_free(chain C, void (*elem_free)(ht_elem e)) {
+    list_free(C->list, elem_free);
+    xfree(C);
 }
 
 table table_new(
-        struct objfs_state *objfs,
         int init_size,
-        ht_key (*elem_key)(struct objfs_state *objfs, ht_elem e),
+        ht_key (*elem_key)(ht_elem e),
         bool (*equal)(ht_key k1, ht_key k2),
         int (*hash)(ht_key k, int m)) {
-    ASSERT(init_size > 1);
-    chain* A = xcalloc(init_size, sizeof(chain));
-    table H = xmalloc(sizeof(struct table));
+    chain *A;
+    xcalloc(A, NULL, init_size, sizeof(chain));
+    table H;
+    xmalloc(H, NULL, sizeof(struct table));
     H->size = init_size;
     H->num_elems = 0;
     H->array = A;
     H->elem_key = elem_key;
     H->equal = equal;
     H->hash = hash;
-    ASSERT(is_table(objfs, H));
     return H;
 }
 
-ht_elem table_search(struct objfs_state *objfs, table H, ht_key k) {
-    ASSERT(is_table(objfs, H));
+ht_elem table_search(table H, ht_key k) {
     int h = (*H->hash)(k, H->size);
     if (H->array[h] == NULL) {
         return NULL;
     }
-    ht_elem e = chain_search(objfs, H, H->array[h], k);
-    ASSERT(e == NULL || (*H->equal)((*H->elem_key)(objfs, e), k));
+    ht_elem e = chain_search(H, H->array[h], k);
     return e;
 }
 
-ht_elem table_insert(struct objfs_state *objfs, table H, ht_elem e) {
-    ASSERT(is_table(objfs, H));
+ht_elem table_insert(table H, ht_key k, ht_elem e) {
     ht_elem old_e;
-    ht_key k = (*H->elem_key)(objfs, e);
     int h = (*H->hash)(k, H->size);
     if (H->array[h] == NULL) {
         H->array[h] = chain_new();
     }
-    old_e = chain_insert(objfs, H, H->array[h], e);
+    old_e = chain_insert(H, H->array[h], e);
     if (old_e != NULL) {
         return old_e;
     }
     H->num_elems++;
-    ASSERT(is_table(objfs, H));
-    ASSERT(table_search(objfs, H, (*H->elem_key)(objfs, e)) == e);
     return NULL;
 }
 
-void table_delete(struct objfs_state *objfs, table H, ht_key k, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
-    ASSERT(is_table(objfs, H));
-    ht_elem e = table_search(objfs, H, k);
-    ASSERT(e != NULL);
+void table_delete(table H, ht_key k, void (*elem_free)(ht_elem e)) {
+    ht_elem e = table_search(H, k);
     int h = (*H->hash)(k, H->size);
-    ASSERT(H->array[h] != NULL);
-    chain_delete(objfs, H, H->array[h], e, elem_free);
+    chain_delete(H, H->array[h], e, elem_free);
     H->num_elems--;
-    ASSERT(is_table(objfs, H));
 }
 
-void table_free(struct objfs_state *objfs, table H, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
-    ASSERT(is_table(objfs, H));
+void table_free(table H, void (*elem_free)(ht_elem e)) {
     int i;
     for (i = 0; i < H->size; i++) {
         chain C = H->array[i];
         if (C != NULL) {
-            chain_free(objfs, C, elem_free);
+            chain_free(C, elem_free);
         }
     }
-    free(H->array);
-    free(H);
+    xfree(H->array);
+    xfree(H);
 }
 // End Hash Table Implementation
 #endif
@@ -268,17 +222,17 @@ void table_free(struct objfs_state *objfs, table H, void (*elem_free)(struct obj
 // https://github.com/lemire/cbitset
 
 // Start Bitmap Implementation
+typedef struct bitmap_t* bitmap_t;
 struct bitmap_t {
     uint64_t* array;
     size_t arraysize;
 };
-typedef struct bitmap_t* bitmap_t;
 
 bitmap_t bitmap_create(size_t size) {
-    bitmap_t bitmap = NULL;
-    bitmap = xmalloc(sizeof(struct bitmap_t));
+    bitmap_t bitmap;
+    xmalloc(bitmap, NULL, sizeof(struct bitmap_t));
     bitmap->arraysize = (size + sizeof(uint64_t) * 8 - 1) / (sizeof(uint64_t) * 8);
-    bitmap->array = xcalloc(bitmap->arraysize, sizeof(uint64_t));
+    xcalloc(bitmap->array, NULL, bitmap->arraysize, sizeof(uint64_t));
     return bitmap;
 }
 
@@ -312,6 +266,11 @@ static inline bool bitmap_get(const bitmap_t bitmap, size_t i) {
     return (bitmap->array[shiftedi] & (((uint64_t)1) << (i % 64))) != 0;
 }
 
+void bitmap_free(bitmap_t bitmap) {
+    xfree(bitmap->array);
+    xfree(bitmap);
+}
+
 size_t bitmap_minimum(const bitmap_t bitmap, int *found) {
     for (size_t i = 0; i < bitmap->arraysize; i++) {
         uint64_t w = ~(bitmap->array[i]);
@@ -324,21 +283,6 @@ size_t bitmap_minimum(const bitmap_t bitmap, int *found) {
 }
 // End bitmap Implementation
 #endif
-
-#define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
-#define KEY_LEN (32) // 256 bit keys
-#define MAX_BLOCKS (8 * 1024 * 1024) // 32GB / 4KB ==> 8 * 2^20
-#define DIR_PTR (12) // 12 direct pointers
-#define S_INDIR_PTR (4) // 4 single indirect pointers
-#define OBJECT_SIZE (128) // 128 bytes
-
-#define malloc_4k(x) do{\
-    (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
-    if ((x) == MAP_FAILED)\
-        (x) = NULL;\
-} while(0)
-
-#define free_4k(x) munmap((x), BLOCK_SIZE)
 
 typedef struct object* object;
 struct object {
@@ -353,10 +297,17 @@ struct object {
     uint64_t pad[2];
 };
 
-static struct objfs_state *objfs_private;
-table objid_table;
-bitmap_t block_bitmap;
-bitmap_t inode_bitmap;
+static object get_object(uint32_t objid);
+static uint32_t set_object(object obj);
+
+ht_key elem_key(ht_elem e) {
+    object obj = get_object(*((uint32_t*)e));
+    void *key;
+    xcalloc(key, NULL, KEY_LEN, sizeof(char));
+    memcpy(key, (void*)(obj->key), KEY_LEN);
+    xfree(obj);
+    return key;
+}
 
 bool equal(ht_key s1, ht_key s2) {
     for (size_t i = 0; i < KEY_LEN; i++) {
@@ -368,80 +319,60 @@ bool equal(ht_key s1, ht_key s2) {
 }
 
 int hash(ht_key s, int m) {
-    ASSERT(m > 1);
     unsigned int a = 1664525;
     unsigned int b = 1013904223; // Inlined Random Number Generator
     unsigned int r = 0xdeadbeef; // Initial Seed
-    int len = KEY_LEN;
     unsigned int h = 0; // An empty string will be mapped to 0.
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < KEY_LEN; i++) {
         h = r * h + ((char*)s)[i]; // mod 2^32
         r = r * a + b; // mod 2^32, linear congruential random number
     }
-    h = h % m; // reduce to range
-    int hx = (int)h;
+    int hx = (int)(h % m);
     if (hx < 0) {
-        hx += m; // Make index positive
+        hx += m;
     }
-    ASSERT(0 <= hx && hx < m);
     return hx;
 }
 
-void elem_free(struct objfs_state *objfs, ht_elem e) {
-    free(e);
+void elem_free(ht_elem e) {
+    xfree(e);
 }
 
-static object get_object(struct objfs_state *objfs, uint32_t objid) {
+table objid_table;
+bitmap_t block_bitmap;
+bitmap_t inode_bitmap;
+
+static object get_object(uint32_t objid) {
     size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
     size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
     // objid = x * inodes_per_block + y
-    objid -= 2;
-    if (objid < 0) {
-        return -1;
-    }
-    size_t x = objid / inodes_per_block;
-    size_t y = objid - x * inodes_per_block;
-
+    size_t x = (objid - 2) / inodes_per_block;
+    size_t y = objid - 2 - x * inodes_per_block;
     object objs, obj;
-    malloc_4k(objs);
-    if (!objs) {
-        dprintf("%s: malloc_4k failed\n", __func__);
-        return NULL;
-    }
-
+    malloc_4k(objs, NULL);
     if (read_block(objfs, x + start_block, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         return NULL;
     }
-    if ((objs + y)->id != objid + 2) {
+    if ((objs + y)->id != objid) {
         dprintf("%s: given objid does not matched with the one stored at inode table\n", __func__);
-        dprintf("%s: obj->id = %d and objid = %d\n", __func__, (objs + y)->id, objid + 2);
+        dprintf("%s: obj->id = %d and objid = %d\n", __func__, (objs + y)->id, objid);
         return NULL;
     }
-    obj = malloc(OBJECT_SIZE);
+    xmalloc(obj, NULL, OBJECT_SIZE);
     memcpy((void*)obj, (void*)(objs + y), OBJECT_SIZE);
     free_4k(objs);
     return obj;
 }
 
-static int write_object(struct objfs *objfs, object obj) {
+static uint32_t set_object(object obj) {
     size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
     size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
     // objid = x * inodes_per_block + y
-    uint32_t objid = obj->id - 2;
-    if (objid < 0) {
-        return -1;
-    }
-    size_t x = objid / inodes_per_block;
-    size_t y = objid - x * inodes_per_block;
-
+    size_t x = (obj->id - 2) / inodes_per_block;
+    size_t y = obj->id - 2 - x * inodes_per_block;
     object objs;
-    malloc_4k(objs);
-    if (!objs) {
-        dprintf("%s: malloc_4k failed\n", __func__);
-        return -1;
-    }
-
+    malloc_4k(objs, -1);
     if (read_block(objfs, x + start_block, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         return -1;
@@ -451,31 +382,13 @@ static int write_object(struct objfs *objfs, object obj) {
         dprintf("%s: write_block returned null\n", __func__);
         return -1;
     }
-
     free_4k(objs);
     return obj->id;
 }
 
-ht_key elem_key(struct objfs_state *objfs, ht_elem e) {
-    ASSERT(e != NULL);
-    object obj = get_object(objfs, *((uint32_t*)e));
-    void *key = xcalloc(KEY_LEN, sizeof(char));
-    memcpy(key, (void*)(obj->key), KEY_LEN);
-#ifndef CACHE
-    free(obj);
-#endif
-    return key;
-}
-
-static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize, struct objfs_state *objfs) {
-    dprintf("%s: start\n", __func__);
-    char *ptr;
-    malloc_4k(ptr);
-    if (!ptr) {
-        dprintf("%s: malloc_4k failed\n", __func__);
-        return -1;
-    }
-
+static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize) {
+    void *ptr;
+    malloc_4k(ptr, -1);
     bitmap = bitmap_create(bitsize);
     size_t end_block = start_block + bitsize / (8 * BLOCK_SIZE);
     for (size_t i = start_block; i < end_block; i++) {
@@ -488,175 +401,32 @@ static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize, stru
             off += sizeof(uint64_t);
         }
     }
-
     free_4k(ptr);
-    dprintf("%s: end\n", __func__);
     return 0;
 }
 
-static int destroy_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize, struct objfs_state *objfs) {
-    dprintf("%s: start\n", __func__);
-    char *ptr;
-    malloc_4k(ptr);
-    if (!ptr) {
-        dprintf("%s: malloc_4k failed\n", __func__);
-        return -1;
-    }
-
-    ASSERT(bitmap_size(bitmap) == (bitsize + sizeof(uint64_t) * 8 - 1) / (sizeof(uint64_t) * 8));
+static int destroy_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize) {
+    void *ptr;
+    malloc_4k(ptr, -1);
     size_t end_block = start_block + bitsize / (8 * BLOCK_SIZE);
     for (size_t i = start_block; i < end_block; i++) {
         size_t off = 0;
         while (off < BLOCK_SIZE) {
-            *((uint64_t*)ptr + off) = bitmap_get_block(bitmap, off + (i - start_block) * BLOCK_SIZE);
+            *((uint64_t*)(ptr + off)) = bitmap_get_block(bitmap, off + (i - start_block) * BLOCK_SIZE);
             off += sizeof(uint64_t);
         }
         if (write_block(objfs, i, ptr) < 0) {
             return -1;
         }
     }
-
     free_4k(ptr);
-    dprintf("%s: end\n", __func__);
     return 0;
 }
 
-static int find_and_read(struct objfs_state *objfs, struct object *obj, char *user_buf, int size) {
-    return 0;
-}
-
-static int find_and_write(struct objfs_state *objfs, struct object *obj, const char *user_buf, int size) {
-    return 0;
-}
-
-// Returns the object ID.  -1 (invalid), 0, 1 - reserved
-long find_object_id(const char *key, struct objfs_state *objfs) {
-    uint32_t objid = *((uint32_t*)table_search(objfs, objid_table, (void*)key));
-    if (objid < 2) {
-        return -1;
-    }
-    object obj = get_object(objfs, objid);
-    ASSERT(equal((void*)(obj->key), (void*)key));
-    return obj->id;
-}
-
-// Creates a new object with obj.key=key. Object ID must be >=2.
-// Must check for duplicates.
-// Return value: Success --> object ID of the newly created object
-//               Failure --> -1
-long create_object(const char *key, struct objfs_state *objfs) {
-    // Check duplicates
-    void *objid_p = table_search(objfs, objid_table, (void*)key);
-    if (objid_p != NULL) {
-        return -1;
-    }
-
-    // @require: atomicity
-    int found = 0;
-    size_t objid = bitmap_minimum(inode_bitmap, &found);
-    if (found == 0) {
-        dprintf("%s: objstore is full\n", __func__);
-        return -1;
-    }
-    bitmap_set(inode_bitmap, objid);
-    // @end: atomicity
-
-    objid += 2; // objid must be >= 2
-    object obj = xcalloc(1, sizeof(struct object));
-    if (!obj) {
-        dprintf("%s: xcalloc failed\n", __func__);
-        return -1;
-    }
-    obj->id = objid;
-    #ifdef CACHE
-    // do caching init
-    #endif
-    memcpy(obj->key, key, KEY_LEN);
-    if (write_object(obj, objfs) != obj->id) {
-        return -1;
-    }
-    free(obj);
-    return objid;
-}
-
-// One of the users of the object has dropped a reference
-// Can be useful to implement caching.
-// Return value: Success --> 0
-//               Failure --> -1
-long release_object(int objid, struct objfs_state *objfs) {
-    return 0;
-}
-
-// Destroys an object with obj.key=key. Object ID is ensured to be >=2.
-// Return value: Success --> 0
-//               Failure --> -1
-long destroy_object(const char *key, struct objfs_state *objfs) {
-    void *objid_p = table_search(objfs, objid_table, (void*)key);
-    if (objid_p == NULL) {
-        return -1;
-    }
-    uint32_t objid = *((uint64_t*)objid_p);
-    if (objid < 0) {
-        return -1;
-    }
-
-    object obj =
-
-    return -1;
-}
-
-// Renames a new object with obj.key=key. Object ID must be >=2.
-// Must check for duplicates.
-// Return value: Success --> object ID of the newly created object
-//               Failure --> -1
-long rename_object(const char *key, const char *newname, struct objfs_state *objfs) {
-    return -1;
-}
-
-// Writes the content of the buffer into the object with objid = objid.
-// Return value: Success --> #of bytes written
-//               Failure --> -1
-long objstore_write(int objid, const char *buf, int size, off_t offset, struct objfs_state *objfs) {
-    return size;
-}
-
-// Reads the content of the object onto the buffer with objid = objid.
-// Return value: Success --> #of bytes written
-//               Failure --> -1
-long objstore_read(int objid, char *buf, int size, off_t offset, struct objfs_state *objfs) {
-    return size;
-}
-
-// Reads the object metadata for obj->id = buf->st_ino
-// Fillup buf->st_size and buf->st_blocks correctly
-// See man 2 stat
-int fillup_size_details(struct stat *buf) {
-    if (buf->st_ino < 2) {
-        return -1;
-    }
-    // Had to do this because template for assigment
-    // did not provide objfs in this function call
-    object obj = get_object(objfs_private, buf->st_ino);
-    if (obj->id != buf->st_ino) {
-        return -1;
-    }
-    buf->st_size = obj->size;
-    // stat contains number of blocks of 512 bytes
-    buf->st_blocks = obj->size >> 9;
-    if (((obj->size >> 9) << 9) != obj->size) {
-        buf->st_blocks += 1;
-    }
-    return 0;
-}
-
-int init_hash_table(struct objfs_state *objfs) {
+static int init_hash_table() {
     object objs;
-    malloc_4k(objs);
-    if (!objs) {
-        dprintf("%s: malloc_4k failed\n", __func__);
-    }
-
-    objid_table = table_new(objfs, MAX_OBJS, &elem_key, &equal, &hash);
+    malloc_4k(objs, -1);
+    objid_table = table_new(MAX_OBJS, &elem_key, &equal, &hash);
     size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
     size_t end_block = start_block + (MAX_OBJS * OBJECT_SIZE) / (BLOCK_SIZE);
     for (size_t i = start_block; i < end_block; i++) {
@@ -670,40 +440,154 @@ int init_hash_table(struct objfs_state *objfs) {
                 off += OBJECT_SIZE;
                 continue;
             }
-            uint32_t *id = xmalloc(sizeof(uint32_t));
+            uint32_t *id;
+            xmalloc(id, -1, sizeof(uint32_t));
             *id = obj->id;
-            table_insert(objfs, objid_table, id);
-            ASSERT(*((uint32_t*)table_search(objfs, objid_table, (void*)obj->key)) == obj->id);
+            table_insert(objid_table, (void*)(obj->key), id);
             off += OBJECT_SIZE;
         }
     }
-
     free_4k(objs);
     return 0;
 }
 
-void destroy_hash_table(struct objfs_state *objfs) {
-    table_free(objfs, objid_table, &elem_free);
+static void destroy_hash_table() {
+    table_free(objid_table, &elem_free);
     return;
 }
 
+// Returns the object ID.  -1 (invalid), 0, 1 - reserved
+long find_object_id(const char *key, objfs_state objfs_local) {
+    objfs = objfs_local;
+    void *ptr = table_search(objid_table, (void*)key);
+    if (ptr == NULL || *((uint32_t*)ptr) < 2) {
+        return -1;
+    }
+    object obj = get_object(*((uint32_t*)ptr));
+    if (!equal((void*)(obj->key), (void*)key)) {
+        return -1;
+    }
+    uint32_t objid = obj->id;
+    xfree(obj);
+    return objid;
+}
+
+// Creates a new object with obj.key=key. Object ID must be >=2.
+// Must check for duplicates.
+// Return value: Success --> object ID of the newly created object
+//               Failure --> -1
+long create_object(const char *key, objfs_state objfs_local) {
+    objfs = objfs_local;
+    // Check duplicates
+    void *ptr = table_search(objid_table, (void*)key);
+    if (ptr != NULL) {
+        return -1;
+    }
+    // @require: atomicity
+    int found = 0;
+    size_t bit_index = bitmap_minimum(inode_bitmap, &found);
+    if (found == 0) {
+        dprintf("%s: objstore is full\n", __func__);
+        return -1;
+    }
+    bitmap_set(inode_bitmap, bit_index);
+    // @end: atomicity
+    object obj;
+    xcalloc(obj, -1, 1, sizeof(struct object));
+    obj->id = bit_index + 2;
+    #ifdef CACHE
+    // do caching init
+    #endif
+    memcpy(obj->key, key, KEY_LEN);
+    if (set_object(obj) != obj->id) {
+        xfree(obj);
+        return -1;
+    }
+    xfree(obj);
+    return bit_index + 2;
+}
+
+// One of the users of the object has dropped a reference
+// Can be useful to implement caching.
+// Return value: Success --> 0
+//               Failure --> -1
+long release_object(int objid, objfs_state objfs_local) {
+    objfs = objfs_local;
+    return 0;
+}
+
+// Destroys an object with obj.key=key. Object ID is ensured to be >=2.
+// Return value: Success --> 0
+//               Failure --> -1
+long destroy_object(const char *key, objfs_state objfs_local) {
+    objfs = objfs_local;
+    void *ptr = table_search(objid_table, (void*)key);
+    if (ptr == NULL || *((uint32_t*)ptr) < 2) {
+        return -1;
+    }
+
+    return -1;
+}
+
+// Renames a new object with obj.key=key. Object ID must be >=2.
+// Must check for duplicates.
+// Return value: Success --> object ID of the newly created object
+//               Failure --> -1
+long rename_object(const char *key, const char *newname, objfs_state objfs_local) {
+    objfs = objfs_local;
+    return -1;
+}
+
+// Writes the content of the buffer into the object with objid = objid.
+// Return value: Success --> #of bytes written
+//               Failure --> -1
+long objstore_write(int objid, const char *buf, int size, off_t offset, objfs_state objfs_local) {
+    objfs = objfs_local;
+    return size;
+}
+
+// Reads the content of the object onto the buffer with objid = objid.
+// Return value: Success --> #of bytes written
+//               Failure --> -1
+long objstore_read(int objid, char *buf, int size, off_t offset, objfs_state objfs_local) {
+    objfs = objfs_local;
+    return size;
+}
+
+// Reads the object metadata for obj->id = buf->st_ino
+// Fillup buf->st_size and buf->st_blocks correctly
+// See man 2 stat
+int fillup_size_details(struct stat *buf) {
+    if (buf->st_ino < 2) {
+        return -1;
+    }
+    object obj = get_object(buf->st_ino);
+    if (obj->id != buf->st_ino) {
+        return -1;
+    }
+    buf->st_size = obj->size;
+    buf->st_blocks = obj->size >> 9;
+    if (((obj->size >> 9) << 9) != obj->size) {
+        buf->st_blocks += 1;
+    }
+    xfree(obj);
+    return 0;
+}
+
 // Set your private pointer, anyway you like.
-int objstore_init(struct objfs_state *objfs) {
-    objfs_private = objfs;
+int objstore_init(objfs_state objfs_local) {
+    objfs = objfs_local;
     if (sizeof(struct object) != OBJECT_SIZE) {
         dprintf("%s: object structure is not of 128 bytes\n", __func__);
         return -1;
     }
-    // read the inode bitmap
-    if (init_bitmap(inode_bitmap, 0, MAX_OBJS, objfs) < 0) {
+    if (init_bitmap(inode_bitmap, 0, MAX_OBJS) < 0) {
         return -1;
     }
-    // read the block bitmap
-    if (init_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS, objfs) < 0) {
+    if (init_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
         return -1;
     }
-    // read the hash table
-    if (init_hash_table(objfs) < 0) {
+    if (init_hash_table() < 0) {
         return -1;
     }
     dprintf("Objstore init completed successfully!\n");
@@ -711,18 +595,15 @@ int objstore_init(struct objfs_state *objfs) {
 }
 
 // Cleanup private data. FS is being unmounted
-int objstore_destroy(struct objfs_state *objfs) {
-    // destroy the inode bitmap
-    if (destroy_bitmap(inode_bitmap, 0, MAX_OBJS, objfs) < 0) {
+int objstore_destroy(objfs_state objfs_local) {
+    objfs = objfs_local;
+    if (destroy_bitmap(inode_bitmap, 0, MAX_OBJS) < 0) {
         return -1;
     }
-    // destroy the block bitmap
-    if (destroy_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS, objfs) < 0) {
+    if (destroy_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
         return -1;
     }
-    // destroy the hash table
-    destroy_hash_table(objfs);
-
+    destroy_hash_table();
     dprintf("Objstore destroy completed successfully!\n");
     return 0;
 }
