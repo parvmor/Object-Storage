@@ -236,10 +236,10 @@ ht_elem table_insert(struct objfs_state *objfs, table H, ht_elem e) {
     return NULL;
 }
 
-void table_delete(struct objfs_state *objfs, table H, ht_elem e, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
+void table_delete(struct objfs_state *objfs, table H, ht_key k, void (*elem_free)(struct objfs_state *objfs, ht_elem e)) {
     ASSERT(is_table(objfs, H));
-    ASSERT(table_search(objfs, H, (*H->elem_key)(objfs, e)) == e);
-    ht_key k = (*H->elem_key)(objfs, e);
+    ht_elem e = table_search(objfs, H, k);
+    ASSERT(e != NULL);
     int h = (*H->hash)(k, H->size);
     ASSERT(H->array[h] != NULL);
     chain_delete(objfs, H, H->array[h], e, elem_free);
@@ -352,6 +352,7 @@ struct object {
     uint64_t pad[2];
 };
 
+static struct objfs_state *objfs_private;
 table objid_table;
 bitmap_t block_bitmap;
 bitmap_t inode_bitmap;
@@ -486,6 +487,12 @@ static int find_and_write(struct objfs_state *objfs, struct object *obj, const c
 
 // Returns the object ID.  -1 (invalid), 0, 1 - reserved
 long find_object_id(const char *key, struct objfs_state *objfs) {
+    uint32_t objid = *((uint32_t*)table_search(objfs, objid_table, (void*)key));
+    object obj = get_object(objfs, objid);
+    if (obj->id) {
+        ASSERT(equal((void*)(obj->key), (void*)key));
+        return obj->id;
+    }
     return -1;
 }
 
@@ -494,6 +501,7 @@ long find_object_id(const char *key, struct objfs_state *objfs) {
 // Return value: Success --> object ID of the newly created object
 //               Failure --> -1
 long create_object(const char *key, struct objfs_state *objfs) {
+    // Find a free inode number
     return 0;
 }
 
@@ -538,6 +546,20 @@ long objstore_read(int objid, char *buf, int size, off_t offset, struct objfs_st
 // Fillup buf->st_size and buf->st_blocks correctly
 // See man 2 stat
 int fillup_size_details(struct stat *buf) {
+    if (buf->st_ino < 1) {
+        return -1;
+    }
+    // Had to do this because template for assigment
+    // did not provide objfs in this function call
+    object obj = get_object(objfs_private, buf->st_ino);
+    if (obj->id != buf->st_ino) {
+        return -1;
+    }
+    buf->st_size = obj->size;
+    buf->st_blocks = obj->size >> 9;
+    if (((obj->size >> 9) << 9) != obj->size) {
+        buf->st_blocks += 1;
+    }
     return 0;
 }
 
@@ -559,12 +581,13 @@ int init_hash_table(struct objfs_state *objfs) {
         while (off < BLOCK_SIZE) {
             object obj = objs + off / OBJECT_SIZE;
             if (obj->id == 0) {
+                off += OBJECT_SIZE;
                 continue;
             }
             uint32_t *id = xmalloc(sizeof(uint32_t));
             *id = obj->id;
             table_insert(objfs, objid_table, id);
-            ASSERT(*((uint32_t*)table_search(objfs, objid_table, obj->key)) == obj->id);
+            ASSERT(*((uint32_t*)table_search(objfs, objid_table, (void*)obj->key)) == obj->id);
             off += OBJECT_SIZE;
         }
     }
@@ -580,6 +603,7 @@ void destroy_hash_table(struct objfs_state *objfs) {
 
 // Set your private pointer, anyway you like.
 int objstore_init(struct objfs_state *objfs) {
+    objfs_private = objfs;
     if (sizeof(struct object) != OBJECT_SIZE) {
         dprintf("%s: object structure is not of 128 bytes\n", __func__);
         return -1;
