@@ -312,10 +312,11 @@ static inline bool bitmap_get(const bitmap_t bitmap, size_t i) {
     return (bitmap->array[shiftedi] & (((uint64_t)1) << (i % 64))) != 0;
 }
 
-size_t bitmap_minimum(const bitmap_t bitmap) {
+size_t bitmap_minimum(const bitmap_t bitmap, int *found) {
     for (size_t i = 0; i < bitmap->arraysize; i++) {
         uint64_t w = ~(bitmap->array[i]);
         if (w != 0) {
+            *found = 1;
             return __builtin_ctzll(w) + i * 64;
         }
     }
@@ -393,7 +394,11 @@ void elem_free(struct objfs_state *objfs, ht_elem e) {
 static object get_object(struct objfs_state *objfs, uint32_t objid) {
     size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
     size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
-    // objid = x * inodes_per_blocks + y
+    // objid = x * inodes_per_block + y
+    objid -= 2;
+    if (objid < 0) {
+        return -1;
+    }
     size_t x = objid / inodes_per_block;
     size_t y = objid - x * inodes_per_block;
 
@@ -401,26 +406,65 @@ static object get_object(struct objfs_state *objfs, uint32_t objid) {
     malloc_4k(objs);
     if (!objs) {
         dprintf("%s: malloc_4k failed\n", __func__);
+        return NULL;
     }
 
     if (read_block(objfs, x + start_block, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         return NULL;
     }
-    if ((objs + y)->id != objid) {
+    if ((objs + y)->id != objid + 2) {
         dprintf("%s: given objid does not matched with the one stored at inode table\n", __func__);
-        dprintf("%s: obj->id = %d and objid = %d\n", __func__, (objs + y)->id, objid);
+        dprintf("%s: obj->id = %d and objid = %d\n", __func__, (objs + y)->id, objid + 2);
         return NULL;
     }
     obj = malloc(OBJECT_SIZE);
-    memcpy(obj, objs + y, OBJECT_SIZE);
+    memcpy((void*)obj, (void*)(objs + y), OBJECT_SIZE);
     free_4k(objs);
     return obj;
 }
 
+static int write_object(struct objfs *objfs, object obj) {
+    size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
+    size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
+    // objid = x * inodes_per_block + y
+    uint32_t objid = obj->id - 2;
+    if (objid < 0) {
+        return -1;
+    }
+    size_t x = objid / inodes_per_block;
+    size_t y = objid - x * inodes_per_block;
+
+    object objs;
+    malloc_4k(objs);
+    if (!objs) {
+        dprintf("%s: malloc_4k failed\n", __func__);
+        return -1;
+    }
+
+    if (read_block(objfs, x + start_block, (void*)objs) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        return -1;
+    }
+    memcpy((void*)(objs + y), (void*)obj, OBJECT_SIZE);
+    if (write_block(objfs, x + start_block, (void*)objs) < 0) {
+        dprintf("%s: write_block returned null\n", __func__);
+        return -1;
+    }
+
+    free_4k(objs);
+    return obj->id;
+}
+
 ht_key elem_key(struct objfs_state *objfs, ht_elem e) {
     ASSERT(e != NULL);
-    return get_object(objfs, *((uint32_t*)e))->key;
+    object obj = get_object(objfs, *((uint32_t*)e));
+    void *key = xcalloc(KEY_LEN, sizeof(char));
+    memcpy(key, (void*)(obj->key), KEY_LEN);
+#ifndef CACHE
+    free(obj);
+#endif
+    return key;
 }
 
 static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize, struct objfs_state *objfs) {
@@ -488,12 +532,12 @@ static int find_and_write(struct objfs_state *objfs, struct object *obj, const c
 // Returns the object ID.  -1 (invalid), 0, 1 - reserved
 long find_object_id(const char *key, struct objfs_state *objfs) {
     uint32_t objid = *((uint32_t*)table_search(objfs, objid_table, (void*)key));
-    object obj = get_object(objfs, objid);
-    if (obj->id) {
-        ASSERT(equal((void*)(obj->key), (void*)key));
-        return obj->id;
+    if (objid < 2) {
+        return -1;
     }
-    return -1;
+    object obj = get_object(objfs, objid);
+    ASSERT(equal((void*)(obj->key), (void*)key));
+    return obj->id;
 }
 
 // Creates a new object with obj.key=key. Object ID must be >=2.
@@ -501,8 +545,38 @@ long find_object_id(const char *key, struct objfs_state *objfs) {
 // Return value: Success --> object ID of the newly created object
 //               Failure --> -1
 long create_object(const char *key, struct objfs_state *objfs) {
-    // Find a free inode number
-    return 0;
+    // Check duplicates
+    void *objid_p = table_search(objfs, objid_table, (void*)key);
+    if (objid_p != NULL) {
+        return -1;
+    }
+
+    // @require: atomicity
+    int found = 0;
+    size_t objid = bitmap_minimum(inode_bitmap, &found);
+    if (found == 0) {
+        dprintf("%s: objstore is full\n", __func__);
+        return -1;
+    }
+    bitmap_set(inode_bitmap, objid);
+    // @end: atomicity
+
+    objid += 2; // objid must be >= 2
+    object obj = xcalloc(1, sizeof(struct object));
+    if (!obj) {
+        dprintf("%s: xcalloc failed\n", __func__);
+        return -1;
+    }
+    obj->id = objid;
+    #ifdef CACHE
+    // do caching init
+    #endif
+    memcpy(obj->key, key, KEY_LEN);
+    if (write_object(obj, objfs) != obj->id) {
+        return -1;
+    }
+    free(obj);
+    return objid;
 }
 
 // One of the users of the object has dropped a reference
@@ -517,6 +591,17 @@ long release_object(int objid, struct objfs_state *objfs) {
 // Return value: Success --> 0
 //               Failure --> -1
 long destroy_object(const char *key, struct objfs_state *objfs) {
+    void *objid_p = table_search(objfs, objid_table, (void*)key);
+    if (objid_p == NULL) {
+        return -1;
+    }
+    uint32_t objid = *((uint64_t*)objid_p);
+    if (objid < 0) {
+        return -1;
+    }
+
+    object obj =
+
     return -1;
 }
 
@@ -546,7 +631,7 @@ long objstore_read(int objid, char *buf, int size, off_t offset, struct objfs_st
 // Fillup buf->st_size and buf->st_blocks correctly
 // See man 2 stat
 int fillup_size_details(struct stat *buf) {
-    if (buf->st_ino < 1) {
+    if (buf->st_ino < 2) {
         return -1;
     }
     // Had to do this because template for assigment
@@ -556,6 +641,7 @@ int fillup_size_details(struct stat *buf) {
         return -1;
     }
     buf->st_size = obj->size;
+    // stat contains number of blocks of 512 bytes
     buf->st_blocks = obj->size >> 9;
     if (((obj->size >> 9) << 9) != obj->size) {
         buf->st_blocks += 1;
@@ -580,7 +666,7 @@ int init_hash_table(struct objfs_state *objfs) {
         size_t off = 0;
         while (off < BLOCK_SIZE) {
             object obj = objs + off / OBJECT_SIZE;
-            if (obj->id == 0) {
+            if (obj->id < 2) {
                 off += OBJECT_SIZE;
                 continue;
             }
