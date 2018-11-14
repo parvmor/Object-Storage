@@ -6,14 +6,14 @@
     (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
     if ((x) == MAP_FAILED) {\
         dprintf("%s: malloc_4k failed\n", __func__);\
-        return (ret);
+        return (ret);\
     }\
 } while(0)
 
 #define xcalloc(x, ret, nobj, size) do {\
     (x) = calloc((nobj), (size));\
     if ((x) == NULL) {\
-        dprintf("%s: xcalloc failed with nobj = %ld and size = %ld\n", __func__, (nobj), (size));\
+        dprintf("%s: xcalloc failed with nobj = %d and size = %ld\n", __func__, ((int)(nobj)), (size));\
         return (ret);\
     }\
 } while(0)
@@ -21,12 +21,17 @@
 #define xmalloc(x, ret, size) do {\
     (x) = malloc((size));\
     if ((x) == NULL) {\
-        dprintf("%s: xmalloc failed with size = %ld\n", __func__, (size));\
+        dprintf("%s: xmalloc failed with size = %ld\n", __func__, ((long int)(size)));\
         return (ret);\
     }\
 } while(0)
 
+#ifdef CACHE
 #define xfree(x) free((x))
+#else
+#define xfree(x) ((void)0)
+#endif
+
 #define free_4k(x) munmap((x), BLOCK_SIZE)
 #define KEY_LEN (32) // 256 bit keys
 #define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
@@ -71,7 +76,7 @@ void list_free(list p, void (*elem_free)(ht_elem e)) {
             (*elem_free)(p->data);
         }
         q = p->next;
-        xfree(p);
+        free(p);
         p = q;
     }
 }
@@ -107,7 +112,7 @@ void chain_delete(table H, chain C, ht_elem e, void (*elem_free)(ht_elem e)) {
     if (p != NULL && p->data == e) {
         C->list = p->next;
         (*elem_free)(p->data);
-        xfree(p);
+        free(p);
         return;
     }
     while (p != NULL && p->data != e) {
@@ -119,7 +124,7 @@ void chain_delete(table H, chain C, ht_elem e, void (*elem_free)(ht_elem e)) {
     }
     old_p->next = p->next;
     (*elem_free)(p->data);
-    xfree(p);
+    free(p);
 }
 
 ht_elem chain_insert(table H, chain C, ht_elem e) {
@@ -141,7 +146,7 @@ ht_elem chain_insert(table H, chain C, ht_elem e) {
 }
 
 ht_elem chain_search(table H, chain C, ht_key k) {
-    list p = chain_find(objfs, H, C, k);
+    list p = chain_find(H, C, k);
     if (p == NULL) {
         return NULL;
     } else {
@@ -151,7 +156,7 @@ ht_elem chain_search(table H, chain C, ht_key k) {
 
 void chain_free(chain C, void (*elem_free)(ht_elem e)) {
     list_free(C->list, elem_free);
-    xfree(C);
+    free(C);
 }
 
 table table_new(
@@ -210,8 +215,8 @@ void table_free(table H, void (*elem_free)(ht_elem e)) {
             chain_free(C, elem_free);
         }
     }
-    xfree(H->array);
-    xfree(H);
+    free(H->array);
+    free(H);
 }
 // End Hash Table Implementation
 #endif
@@ -267,8 +272,8 @@ static inline bool bitmap_get(const bitmap_t bitmap, size_t i) {
 }
 
 void bitmap_free(bitmap_t bitmap) {
-    xfree(bitmap->array);
-    xfree(bitmap);
+    free(bitmap->array);
+    free(bitmap);
 }
 
 size_t bitmap_minimum(const bitmap_t bitmap, int *found) {
@@ -335,7 +340,7 @@ int hash(ht_key s, int m) {
 }
 
 void elem_free(ht_elem e) {
-    xfree(e);
+    free(e);
 }
 
 table objid_table;
@@ -541,7 +546,7 @@ long rename_object(const char *key, const char *newname, objfs_state objfs_local
 // Writes the content of the buffer into the object with objid = objid.
 // Return value: Success --> #of bytes written
 //               Failure --> -1
-long objstore_write(int objid, const char *buf, int size, off_t offset, objfs_state objfs_local) {
+long objstore_write(int objid, const char *buf, int size, objfs_state objfs_local, off_t offset) {
     objfs = objfs_local;
     return size;
 }
@@ -549,7 +554,7 @@ long objstore_write(int objid, const char *buf, int size, off_t offset, objfs_st
 // Reads the content of the object onto the buffer with objid = objid.
 // Return value: Success --> #of bytes written
 //               Failure --> -1
-long objstore_read(int objid, char *buf, int size, off_t offset, objfs_state objfs_local) {
+long objstore_read(int objid, char *buf, int size, objfs_state objfs_local, off_t offset) {
     objfs = objfs_local;
     return size;
 }
@@ -557,7 +562,8 @@ long objstore_read(int objid, char *buf, int size, off_t offset, objfs_state obj
 // Reads the object metadata for obj->id = buf->st_ino
 // Fillup buf->st_size and buf->st_blocks correctly
 // See man 2 stat
-int fillup_size_details(struct stat *buf) {
+int fillup_size_details(struct stat *buf, objfs_state objfs_local) {
+    objfs = objfs_local;
     if (buf->st_ino < 2) {
         return -1;
     }
