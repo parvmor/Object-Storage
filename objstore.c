@@ -35,10 +35,17 @@
 #define free_4k(x) munmap((x), BLOCK_SIZE)
 #define KEY_LEN (32) // 256 bit keys
 #define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
-#define MAX_BLOCKS (8 * 1024 * 1024) // 32GB / 4KB ==> 8 * 2^20
+// #define MAX_BLOCKS (8 * 1024 * 1024) // 32GB / 4KB ==> 8 * 2^20
+#define MAX_BLOCKS (objfs->disksize)
 #define DIR_PTR (12) // 12 direct pointers
 #define S_INDIR_PTR (4) // 4 single indirect pointers
 #define OBJECT_SIZE (128) // 128 bytes
+#define INODES_PER_BLOCK ((BLOCK_SIZE) / (OBJECT_SIZE))
+#define INODE_START_BLOCK (((MAX_OBJS) + (MAX_BLOCKS)) / (8 * (BLOCK_SIZE)))
+#define DATA_START_BLOCK (INODE_START_BLOCK + (((MAX_OBJS) * (OBJECT_SIZE)) / (BLOCK_SIZE)))
+
+#define min(a, b) (((a) > (b)) ? (b) : (a))
+#define max(a, b) (((b) > (a)) ? (b) : (a))
 
 typedef struct objfs_state* objfs_state;
 static objfs_state objfs;
@@ -245,12 +252,12 @@ static inline size_t bitmap_size(const bitmap_t bitmap) {
     return bitmap->arraysize;
 }
 
-static inline void bitmap_set_block(bitmap_t bitmap, size_t shiftedi, uint64_t value) {
-    bitmap->array[shiftedi] = value;
+static inline void bitmap_set_block(bitmap_t bitmap, size_t i, uint64_t value) {
+    bitmap->array[i >> 6] = value;
 }
 
-static inline uint64_t bitmap_get_block(const bitmap_t bitmap, size_t shiftedi) {
-    return bitmap->array[shiftedi];
+static inline uint64_t bitmap_get_block(const bitmap_t bitmap, size_t i) {
+    return bitmap->array[i >> 6];
 }
 
 static inline void bitmap_set(bitmap_t bitmap, size_t i) {
@@ -303,13 +310,17 @@ struct object {
 };
 
 static object get_object(uint32_t objid);
-static uint32_t set_object(object obj);
+static int set_object(object obj);
 
 ht_key elem_key(ht_elem e) {
     object obj = get_object(*((uint32_t*)e));
+#ifdef CACHE
+    // pass the cache memory pointer
+#else
     void *key;
     xcalloc(key, NULL, KEY_LEN, sizeof(char));
     memcpy(key, (void*)(obj->key), KEY_LEN);
+#endif
     xfree(obj);
     return key;
 }
@@ -318,6 +329,9 @@ bool equal(ht_key s1, ht_key s2) {
     for (size_t i = 0; i < KEY_LEN; i++) {
         if (*(((char*)s1) + i) != *(((char*)s2) + i)) {
             return 0;
+        }
+        if (*(((char*)s1) + i) == 0) {
+            return 1;
         }
     }
     return 1;
@@ -329,6 +343,9 @@ int hash(ht_key s, int m) {
     unsigned int r = 0xdeadbeef; // Initial Seed
     unsigned int h = 0; // An empty string will be mapped to 0.
     for (int i = 0; i < KEY_LEN; i++) {
+        if (((char*)s)[i] == 0) {
+            break;
+        }
         h = r * h + ((char*)s)[i]; // mod 2^32
         r = r * a + b; // mod 2^32, linear congruential random number
     }
@@ -348,20 +365,20 @@ bitmap_t block_bitmap;
 bitmap_t inode_bitmap;
 
 static object get_object(uint32_t objid) {
-    size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
-    size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
     // objid = x * inodes_per_block + y
-    size_t x = (objid - 2) / inodes_per_block;
-    size_t y = objid - 2 - x * inodes_per_block;
+    size_t x = (objid - 2) / INODES_PER_BLOCK;
+    size_t y = objid - 2 - x * INODES_PER_BLOCK;
     object objs, obj;
     malloc_4k(objs, NULL);
-    if (read_block(objfs, x + start_block, (void*)objs) < 0) {
+    if (read_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
+        free_4k(objs);
         return NULL;
     }
     if ((objs + y)->id != objid) {
         dprintf("%s: given objid does not matched with the one stored at inode table\n", __func__);
         dprintf("%s: obj->id = %d and objid = %d\n", __func__, (objs + y)->id, objid);
+        free_4k(objs);
         return NULL;
     }
     xmalloc(obj, NULL, OBJECT_SIZE);
@@ -370,39 +387,222 @@ static object get_object(uint32_t objid) {
     return obj;
 }
 
-static uint32_t set_object(object obj) {
-    size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
-    size_t inodes_per_block = BLOCK_SIZE / OBJECT_SIZE;
+static int set_object(object obj) {
     // objid = x * inodes_per_block + y
-    size_t x = (obj->id - 2) / inodes_per_block;
-    size_t y = obj->id - 2 - x * inodes_per_block;
+    size_t x = (obj->id - 2) / INODES_PER_BLOCK;
+    size_t y = obj->id - 2 - x * INODES_PER_BLOCK;
     object objs;
     malloc_4k(objs, -1);
-    if (read_block(objfs, x + start_block, (void*)objs) < 0) {
+    if (read_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
+        free_4k(objs);
         return -1;
     }
     memcpy((void*)(objs + y), (void*)obj, OBJECT_SIZE);
-    if (write_block(objfs, x + start_block, (void*)objs) < 0) {
+    if (write_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: write_block returned null\n", __func__);
+        free_4k(objs);
         return -1;
     }
     free_4k(objs);
     return obj->id;
 }
 
-static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize) {
+static int invalidate_block(uint32_t blockid) {
+    if (blockid < DATA_START_BLOCK) {
+        return -1;
+    }
+    if (bitmap_get(block_bitmap, blockid - DATA_START_BLOCK) == false) {
+        return -1;
+    }
+#ifdef CACHE
+    // remove it from the cache if present
+#endif
+    bitmap_clear(block_bitmap, blockid - DATA_START_BLOCK);
+    return 0;
+}
+
+static int invalidate_indirect_block(uint32_t blockid) {
+    if (blockid < DATA_START_BLOCK) {
+        return -1;
+    }
+    uint32_t *block;
+    malloc_4k(block, -1);
+    if (read_block(objfs, blockid, (void*)block) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        return -1;
+    }
+    for (size_t i = 0; i < BLOCK_SIZE / sizeof(uint32_t); i++) {
+        invalidate_block(block[i]);
+    }
+    free_4k(block);
+    invalidate_block(blockid);
+    return 0;
+}
+
+static int free_object(object obj) {
+    uint32_t objid = obj->id;
+    obj->id = 0;
+    obj->size = 0;
+    for (size_t i = 0; i < DIR_PTR; i++) {
+        invalidate_block(obj->dir_ptr[i]);
+        obj->dir_ptr[i] = 0;
+    }
+    for (size_t i = 0; i < S_INDIR_PTR; i++) {
+        invalidate_indirect_block(obj->s_indir_ptr[i]);
+        obj->s_indir_ptr[i] = 0;
+    }
+    // objid = x * inodes_per_block + y
+    size_t x = (objid - 2) / INODES_PER_BLOCK;
+    size_t y = objid - 2 - x * INODES_PER_BLOCK;
+    object objs;
+    malloc_4k(objs, -1);
+    if (read_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        free_4k(objs);
+        return -1;
+    }
+    memcpy((void*)(objs + y), (void*)obj, OBJECT_SIZE);
+    if (write_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+        dprintf("%s: write_block returned null\n", __func__);
+        free_4k(objs);
+        return -1;
+    }
+    free_4k(objs);
+    return obj->id;
+}
+
+static int write_direct_data_block(object obj, size_t ind, const char *buf, size_t size) {
+    int found = 0;
+    size_t bit_index = bitmap_minimum(block_bitmap, &found);
+    if (found == 0) {
+        dprintf("%s: objstore is full\n", __func__);
+        return -1;
+    }
+    bitmap_set(block_bitmap, bit_index);
+    size_t block = bit_index + DATA_START_BLOCK;
+    obj->dir_ptr[ind] = block;
+
     void *ptr;
     malloc_4k(ptr, -1);
-    bitmap = bitmap_create(bitsize);
+    memcpy(ptr, (void*)buf, size);
+    if (write_block(objfs, block, (void*)ptr) < 0) {
+        dprintf("%s: write_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+    free_4k(ptr);
+    return 0;
+}
+
+static int write_indirect_direct_data_block(object obj, size_t ind, const char *buf, size_t size) {
+    size_t indir_ind = (ind - DIR_PTR) / (BLOCK_SIZE / sizeof(uint32_t));
+    size_t indir_off = ind - DIR_PTR - indir_ind * (BLOCK_SIZE / sizeof(uint32_t));
+    if (indir_ind >= S_INDIR_PTR) {
+        return -1;
+    }
+    if (obj->s_indir_ptr[indir_ind] < DATA_START_BLOCK || (bitmap_get(block_bitmap, obj->s_indir_ptr[indir_ind] - DATA_START_BLOCK) == false)) {
+        int found = 0;
+        size_t bit_index = bitmap_minimum(block_bitmap, &found);
+        if (found == 0) {
+            dprintf("%s: objstore is full\n", __func__);
+            return -1;
+        }
+        bitmap_set(block_bitmap, bit_index);
+        size_t block = bit_index + DATA_START_BLOCK;
+        obj->s_indir_ptr[indir_ind] = block;
+        dprintf("%s: %ld\n", __func__, block);
+    }
+
+    size_t blockid = obj->s_indir_ptr[indir_ind];
+    uint32_t *ptr;
+    malloc_4k(ptr, -1);
+    if (read_block(objfs, blockid, (void*)ptr) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+
+    int found = 0;
+    size_t bit_index = bitmap_minimum(block_bitmap, &found);
+    if (found == 0) {
+        dprintf("%s: objstore is full\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+    bitmap_set(block_bitmap, bit_index);
+    size_t block = bit_index + DATA_START_BLOCK;
+    ptr[indir_off] = block;
+    if (write_block(objfs, blockid, (void*)ptr) < 0) {
+        dprintf("%s: write_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+
+    memcpy((void*)ptr, (void*)buf, size);
+    if (write_block(objfs, block, (void*)ptr) < 0) {
+        dprintf("%s: write_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+    free_4k(ptr);
+    return 0;
+}
+
+static int read_direct_data_block(object obj, size_t ind, const char *buf, size_t size) {
+    // Assuming this block is in bitmap
+    size_t block = obj->dir_ptr[ind];
+    void *ptr;
+    malloc_4k(ptr, -1);
+    if (read_block(objfs, block, (void*)ptr) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+    memcpy((void*)buf, ptr, size);
+    free_4k(ptr);
+    return 0;
+}
+
+static int read_indirect_data_block(object obj, size_t ind, const char *buf, size_t size) {
+    size_t indir_ind = (ind - DIR_PTR) / (BLOCK_SIZE / sizeof(uint32_t));
+    size_t indir_off = ind - DIR_PTR - indir_ind * (BLOCK_SIZE / sizeof(uint32_t));
+    if (indir_ind >= S_INDIR_PTR) {
+        return -1;
+    }
+    size_t block = obj->s_indir_ptr[indir_ind];
+    dprintf("%s: %ld\n", __func__, block);
+    uint32_t *ptr;
+    malloc_4k(ptr, -1);
+    if (read_block(objfs, block, (void*)ptr) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+    block = ptr[indir_off];
+    if (read_block(objfs, block, (void*)ptr) < 0) {
+        dprintf("%s: read_block returned null\n", __func__);
+        free_4k(ptr);
+        return -1;
+    }
+    memcpy((void*)buf, (void*)ptr, size);
+    free_4k(ptr);
+    return 0;
+}
+
+static int init_bitmap(bitmap_t *bitmap, size_t start_block, size_t bitsize) {
+    void *ptr;
+    malloc_4k(ptr, -1);
+    *bitmap = bitmap_create(bitsize);
     size_t end_block = start_block + bitsize / (8 * BLOCK_SIZE);
     for (size_t i = start_block; i < end_block; i++) {
         if (read_block(objfs, i, ptr) < 0) {
+            free_4k(ptr);
             return -1;
         }
         size_t off = 0;
         while (off < BLOCK_SIZE) {
-            bitmap_set_block(bitmap, off + (i - start_block) * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
+            bitmap_set_block(*bitmap, off + (i - start_block) * BLOCK_SIZE, *((uint64_t*)(ptr + off)));
             off += sizeof(uint64_t);
         }
     }
@@ -410,21 +610,23 @@ static int init_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize) {
     return 0;
 }
 
-static int destroy_bitmap(bitmap_t bitmap, size_t start_block, size_t bitsize) {
+static int destroy_bitmap(bitmap_t *bitmap, size_t start_block, size_t bitsize) {
     void *ptr;
     malloc_4k(ptr, -1);
     size_t end_block = start_block + bitsize / (8 * BLOCK_SIZE);
     for (size_t i = start_block; i < end_block; i++) {
         size_t off = 0;
         while (off < BLOCK_SIZE) {
-            *((uint64_t*)(ptr + off)) = bitmap_get_block(bitmap, off + (i - start_block) * BLOCK_SIZE);
+            *((uint64_t*)(ptr + off)) = bitmap_get_block(*bitmap, off + (i - start_block) * BLOCK_SIZE);
             off += sizeof(uint64_t);
         }
         if (write_block(objfs, i, ptr) < 0) {
+            free_4k(ptr);
             return -1;
         }
     }
     free_4k(ptr);
+    bitmap_free(*bitmap);
     return 0;
 }
 
@@ -432,10 +634,9 @@ static int init_hash_table() {
     object objs;
     malloc_4k(objs, -1);
     objid_table = table_new(MAX_OBJS, &elem_key, &equal, &hash);
-    size_t start_block = (MAX_OBJS + MAX_BLOCKS) / (8 * BLOCK_SIZE);
-    size_t end_block = start_block + (MAX_OBJS * OBJECT_SIZE) / (BLOCK_SIZE);
-    for (size_t i = start_block; i < end_block; i++) {
+    for (size_t i = INODE_START_BLOCK; i < DATA_START_BLOCK; i++) {
         if (read_block(objfs, i, (void*)objs) < 0) {
+            free_4k(objs);
             return -1;
         }
         size_t off = 0;
@@ -469,9 +670,6 @@ long find_object_id(const char *key, objfs_state objfs_local) {
         return -1;
     }
     object obj = get_object(*((uint32_t*)ptr));
-    if (!equal((void*)(obj->key), (void*)key)) {
-        return -1;
-    }
     uint32_t objid = obj->id;
     xfree(obj);
     return objid;
@@ -500,15 +698,26 @@ long create_object(const char *key, objfs_state objfs_local) {
     object obj;
     xcalloc(obj, -1, 1, sizeof(struct object));
     obj->id = bit_index + 2;
+    obj->size = 0;
+    for (size_t i = 0; i < DIR_PTR; i++) {
+        obj->dir_ptr[i] = 0;
+    }
+    for (size_t i = 0; i < S_INDIR_PTR; i++) {
+        obj->s_indir_ptr[i] = 0;
+    }
     #ifdef CACHE
     // do caching init
     #endif
     memcpy(obj->key, key, KEY_LEN);
     if (set_object(obj) != obj->id) {
-        xfree(obj);
+        free(obj);
         return -1;
     }
-    xfree(obj);
+    uint32_t *id;
+    xmalloc(id, -1, sizeof(uint32_t));
+    *id = obj->id;
+    table_insert(objid_table, (void*)(obj->key), id);
+    free(obj);
     return bit_index + 2;
 }
 
@@ -518,6 +727,14 @@ long create_object(const char *key, objfs_state objfs_local) {
 //               Failure --> -1
 long release_object(int objid, objfs_state objfs_local) {
     objfs = objfs_local;
+    if (objid < 2) {
+        return -1;
+    }
+    object obj = get_object(objid);
+    if (obj->id != objid) {
+        return -1;
+    }
+    // TODO
     return 0;
 }
 
@@ -530,8 +747,16 @@ long destroy_object(const char *key, objfs_state objfs_local) {
     if (ptr == NULL || *((uint32_t*)ptr) < 2) {
         return -1;
     }
-
-    return -1;
+    uint32_t objid = *((uint32_t*)ptr);
+    table_delete(objid_table, (void*)key, &elem_free);
+    object obj = get_object(objid);
+    if (free_object(obj) < 0) {
+        xfree(obj);
+        return -1;
+    }
+    xfree(obj);
+    bitmap_clear(inode_bitmap, objid - 2);
+    return 0;
 }
 
 // Renames a new object with obj.key=key. Object ID must be >=2.
@@ -540,7 +765,28 @@ long destroy_object(const char *key, objfs_state objfs_local) {
 //               Failure --> -1
 long rename_object(const char *key, const char *newname, objfs_state objfs_local) {
     objfs = objfs_local;
-    return -1;
+    void *ptr = table_search(objid_table, (void*)newname);
+    if (ptr != NULL) {
+        return -1;
+    }
+    ptr = table_search(objid_table, (void*)key);
+    if (ptr == NULL || *((uint32_t*)ptr) < 2) {
+        return -1;
+    }
+    uint32_t objid = *((uint32_t*)ptr);
+    table_delete(objid_table, (void*)key, &elem_free);
+    object obj = get_object(objid);
+    memcpy((void*)(obj->key), (void*)newname, KEY_LEN);
+    uint32_t *id;
+    xmalloc(id, -1, sizeof(uint32_t));
+    *id = obj->id;
+    table_insert(objid_table, (void*)obj->key, id);
+    if (set_object(obj) != obj->id) {
+        free(obj);
+        return -1;
+    }
+    free(obj);
+    return objid;
 }
 
 // Writes the content of the buffer into the object with objid = objid.
@@ -548,14 +794,66 @@ long rename_object(const char *key, const char *newname, objfs_state objfs_local
 //               Failure --> -1
 long objstore_write(int objid, const char *buf, int size, objfs_state objfs_local, off_t offset) {
     objfs = objfs_local;
+    if (objid < 2) {
+        return -1;
+    }
+    object obj = get_object(objid);
+    // offset is 4K aligned.
+    if (((offset >> 12) << 12) != offset) {
+        dprintf("%s: offset is not 4k aligned\n", __func__);
+        return -1;
+    }
+    for (size_t i = 0; i < size; i += BLOCK_SIZE) {
+        size_t ind = (i + offset) / BLOCK_SIZE;
+        int ret;
+        if (ind < DIR_PTR) {
+            // Can be written to a direct pointer
+            ret = write_direct_data_block(obj, ind, buf + i, min(size - i, BLOCK_SIZE));
+        } else {
+            // requires an indirect pointer
+            ret = write_indirect_direct_data_block(obj, ind, buf + i, min(size - i, BLOCK_SIZE));
+        }
+        if (ret < 0) {
+            dprintf("%s: file size might exceed 16MB\n", __func__);
+            xfree(obj);
+            return -1;
+        }
+    }
+    obj->size += size;
+    if (set_object(obj) != obj->id) {
+        return -1;
+    }
+    xfree(obj);
     return size;
 }
 
 // Reads the content of the object onto the buffer with objid = objid.
-// Return value: Success --> #of bytes written
+// Return value: Success --> #of bytes read
 //               Failure --> -1
 long objstore_read(int objid, char *buf, int size, objfs_state objfs_local, off_t offset) {
     objfs = objfs_local;
+    if (objid < 2) {
+        return -1;
+    }
+    object obj = get_object(objid);
+    if (((offset >> 12) << 12) != offset) {
+        dprintf("%s: offset is not 4k aligned\n", __func__);
+        return -1;
+    }
+    for (size_t i = 0; i < size; i += BLOCK_SIZE) {
+        size_t ind = (i + offset) / BLOCK_SIZE;
+        int ret;
+        if (ind < DIR_PTR) {
+            ret = read_direct_data_block(obj, ind, buf + i, min(size - i, BLOCK_SIZE));
+        } else {
+            ret = read_indirect_data_block(obj, ind, buf + i, min(size - i, BLOCK_SIZE));
+        }
+        if (ret < 0) {
+            xfree(obj);
+            return -1;
+        }
+    }
+    xfree(obj);
     return size;
 }
 
@@ -569,6 +867,7 @@ int fillup_size_details(struct stat *buf, objfs_state objfs_local) {
     }
     object obj = get_object(buf->st_ino);
     if (obj->id != buf->st_ino) {
+        xfree(obj);
         return -1;
     }
     buf->st_size = obj->size;
@@ -587,10 +886,10 @@ int objstore_init(objfs_state objfs_local) {
         dprintf("%s: object structure is not of 128 bytes\n", __func__);
         return -1;
     }
-    if (init_bitmap(inode_bitmap, 0, MAX_OBJS) < 0) {
+    if (init_bitmap(&inode_bitmap, 0, MAX_OBJS) < 0) {
         return -1;
     }
-    if (init_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
+    if (init_bitmap(&block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
         return -1;
     }
     if (init_hash_table() < 0) {
@@ -603,10 +902,10 @@ int objstore_init(objfs_state objfs_local) {
 // Cleanup private data. FS is being unmounted
 int objstore_destroy(objfs_state objfs_local) {
     objfs = objfs_local;
-    if (destroy_bitmap(inode_bitmap, 0, MAX_OBJS) < 0) {
+    if (destroy_bitmap(&inode_bitmap, 0, MAX_OBJS) < 0) {
         return -1;
     }
-    if (destroy_bitmap(block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
+    if (destroy_bitmap(&block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
         return -1;
     }
     destroy_hash_table();
