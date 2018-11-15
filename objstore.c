@@ -1078,6 +1078,7 @@ int objstore_init(objfs_state objfs_local) {
         global = 0;
         return -1;
     }
+    #ifdef CACHE
     // cache_mapping from MAX_CACHE_BLOCKS to blockid this index represents.
     // block 0 is never hashed and hence is the default value.
     xcalloc(cache_mapping, -1, MAX_CACHE_BLOCKS, sizeof(uint32_t));
@@ -1089,6 +1090,7 @@ int objstore_init(objfs_state objfs_local) {
             return -1;
         }
     }
+    #endif
     if (init_hash_table() < 0) {
         global = 0;
         return -1;
@@ -1110,6 +1112,7 @@ int objstore_destroy(objfs_state objfs_local) {
         return -1;
     }
     destroy_hash_table();
+    #ifdef CACHE
     free(cache_mapping);
     free(cache_dirty);
     for (size_t i = 0; i < MAX_CACHE_BLOCKS; i++) {
@@ -1119,6 +1122,7 @@ int objstore_destroy(objfs_state objfs_local) {
         }
     }
     free(cache_mutex);
+    #endif
     global = 0;
     return 0;
 }
