@@ -48,6 +48,7 @@
 
 typedef struct objfs_state* objfs_state;
 static objfs_state objfs;
+volatile int global = 0;
 
 #ifndef __HASH_TABLE_H__
 #define __HASH_TABLE_H__
@@ -865,6 +866,7 @@ static void destroy_hash_table() {
 
 // Returns the object ID.  -1 (invalid), 0, 1 - reserved
 long find_object_id(const char *key, objfs_state objfs_local) {
+    while (global == 1);
     objfs = objfs_local;
     table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)key);
@@ -884,6 +886,7 @@ long find_object_id(const char *key, objfs_state objfs_local) {
 // Return value: Success --> object ID of the newly created object
 //               Failure --> -1
 long create_object(const char *key, objfs_state objfs_local) {
+    while (global == 1);
     objfs = objfs_local;
     // Check duplicates
     table_lock(objid_table);
@@ -933,6 +936,7 @@ long create_object(const char *key, objfs_state objfs_local) {
 // Return value: Success --> 0
 //               Failure --> -1
 long release_object(int objid, objfs_state objfs_local) {
+    while (global == 1);
     objfs = objfs_local;
     // I don't think this is of any use as of now. Hence, no need to implement it.
     // Maybe useful in cache eviction policies that are not deterministic.
@@ -943,6 +947,7 @@ long release_object(int objid, objfs_state objfs_local) {
 // Return value: Success --> 0
 //               Failure --> -1
 long destroy_object(const char *key, objfs_state objfs_local) {
+    while (global == 1);
     objfs = objfs_local;
     table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)key);
@@ -971,6 +976,7 @@ long destroy_object(const char *key, objfs_state objfs_local) {
 // Return value: Success --> object ID of the newly created object
 //               Failure --> -1
 long rename_object(const char *key, const char *newname, objfs_state objfs_local) {
+    while (global == 1);
     objfs = objfs_local;
     table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)newname);
@@ -1004,6 +1010,7 @@ long rename_object(const char *key, const char *newname, objfs_state objfs_local
 // Return value: Success --> #of bytes written
 //               Failure --> -1
 long objstore_write(int objid, const char *buf, int size, objfs_state objfs_local, off_t offset) {
+    while (global == 1);
     objfs = objfs_local;
     if (objid < 2) {
         return -1;
@@ -1042,6 +1049,7 @@ long objstore_write(int objid, const char *buf, int size, objfs_state objfs_loca
 // Return value: Success --> #of bytes read
 //               Failure --> -1
 long objstore_read(int objid, char *buf, int size, objfs_state objfs_local, off_t offset) {
+    while (global == 1);
     objfs = objfs_local;
     if (objid < 2) {
         return -1;
@@ -1072,6 +1080,7 @@ long objstore_read(int objid, char *buf, int size, objfs_state objfs_local, off_
 // Fillup buf->st_size and buf->st_blocks correctly
 // See man 2 stat
 int fillup_size_details(struct stat *buf, objfs_state objfs_local) {
+    while (global == 1);
     objfs = objfs_local;
     if (buf->st_ino < 2) {
         return -1;
@@ -1093,14 +1102,18 @@ int fillup_size_details(struct stat *buf, objfs_state objfs_local) {
 // Set your private pointer, anyway you like.
 int objstore_init(objfs_state objfs_local) {
     objfs = objfs_local;
+    global = 1;
     if (sizeof(struct object) != OBJECT_SIZE) {
+        global = 0;
         dprintf("%s: object structure is not of 128 bytes\n", __func__);
         return -1;
     }
     if (init_bitmap(&inode_bitmap, 0, MAX_OBJS) < 0) {
+        global = 0;
         return -1;
     }
     if (init_bitmap(&block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
+        global = 0;
         return -1;
     }
     // cache_mapping from MAX_CACHE_BLOCKS to blockid this index represents.
@@ -1110,13 +1123,16 @@ int objstore_init(objfs_state objfs_local) {
     xmalloc(cache_mutex, -1, MAX_CACHE_BLOCKS * sizeof(pthread_mutex_t));
     for (size_t i = 0; i < MAX_CACHE_BLOCKS; i++) {
         if (pthread_mutex_init(&(cache_mutex[i]), NULL) != 0) {
+            global = 0;
             dprintf("mutex_init error\n");
             return -1;
         }
     }
     if (init_hash_table() < 0) {
+        global = 0;
         return -1;
     }
+    global = 0;
     dprintf("Objstore init completed successfully!\n");
     return 0;
 }
@@ -1124,10 +1140,13 @@ int objstore_init(objfs_state objfs_local) {
 // Cleanup private data. FS is being unmounted
 int objstore_destroy(objfs_state objfs_local) {
     objfs = objfs_local;
+    global = 1;
     if (destroy_bitmap(&inode_bitmap, 0, MAX_OBJS) < 0) {
+        global = 0;
         return -1;
     }
     if (destroy_bitmap(&block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
+        global = 0;
         return -1;
     }
     destroy_hash_table();
@@ -1135,11 +1154,13 @@ int objstore_destroy(objfs_state objfs_local) {
     free(cache_dirty);
     for (size_t i = 0; i < MAX_CACHE_BLOCKS; i++) {
         if (pthread_mutex_destroy(&(cache_mutex[i])) != 0) {
+            global = 0;
             dprintf("mutex_destroy error\n");
             return -1;
         }
     }
     free(cache_mutex);
+    global = 0;
     dprintf("Objstore destroy completed successfully!\n");
     return 0;
 }
