@@ -58,6 +58,7 @@ int read_block(struct objfs_state *objfs, long block_offset, char *buf)
           return -1;
      }
     block_offset <<= BLOCK_SHIFT;
+	#if 0
     if(lseek(objfs->blkdev, block_offset, SEEK_SET) < 0){
           dprintf("%s: lseek error\n", __func__);
           return -1;
@@ -66,6 +67,12 @@ int read_block(struct objfs_state *objfs, long block_offset, char *buf)
           dprintf("%s: read error\n", __func__);
           return -1;
     }
+	#else
+	if (pread(objfs->blkdev, buf, BLOCK_SIZE, block_offset) < 0) {
+        dprintf("%s: read error\n", __func__);
+        return -1;
+    }
+	#endif
     return 0;
 }
 int write_block(struct objfs_state *objfs, long block_offset, char *buf)
@@ -76,13 +83,20 @@ int write_block(struct objfs_state *objfs, long block_offset, char *buf)
           return -1;
      }
     block_offset <<= BLOCK_SHIFT;
+    #if 0
     if(lseek(objfs->blkdev, block_offset, SEEK_SET) < 0){
           dprintf("%s: lseek error\n", __func__);
           return -1;
     }
     if(write(objfs->blkdev, buf, BLOCK_SIZE) < 0){
-          dprintf("%s: read error\n", __func__);
+          dprintf("%s: write error\n", __func__);
           return -1;
     }
+    #else
+    if (pwrite(objfs->blkdev, buf, BLOCK_SIZE, block_offset) < 0) {
+        dprintf("%s: write error\n", __func__);
+        return -1;
+    }
+    #endif
     return 0;
 }

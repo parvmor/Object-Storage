@@ -1,6 +1,7 @@
 #pragma GCC optimize ("O3")
 #include "lib.h"
 #include "stdbool.h"
+#include "pthread.h"
 
 #define malloc_4k(x, ret) do{\
     (x) = mmap(NULL, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);\
@@ -26,12 +27,7 @@
     }\
 } while(0)
 
-#ifdef CACHE
 #define xfree(x) free((x))
-#else
-#define xfree(x) ((void)0)
-#endif
-
 #define free_4k(x) munmap((x), BLOCK_SIZE)
 #define KEY_LEN (32) // 256 bit keys
 #define MAX_OBJS (1024 * 1024) // 2^20 \approx 10^6 objects
@@ -43,6 +39,9 @@
 #define INODES_PER_BLOCK ((BLOCK_SIZE) / (OBJECT_SIZE))
 #define INODE_START_BLOCK (((MAX_OBJS) + (MAX_BLOCKS)) / (8 * (BLOCK_SIZE)))
 #define DATA_START_BLOCK (INODE_START_BLOCK + (((MAX_OBJS) * (OBJECT_SIZE)) / (BLOCK_SIZE)))
+#define MAX_CACHE_BLOCKS ((CACHE_SIZE) / (BLOCK_SIZE))
+#define CACHE_MASK ((1<<15) - 1)
+#define CACHE_BIT (15)
 
 #define min(a, b) (((a) > (b)) ? (b) : (a))
 #define max(a, b) (((b) > (a)) ? (b) : (a))
@@ -64,8 +63,8 @@ typedef struct list* list;
 
 struct table {
     int size;
-    int num_elems;
     chain* array;
+    pthread_mutex_t mutex;
     ht_key (*elem_key)(ht_elem e);
     bool (*equal)(ht_key k1, ht_key k2);
     int (*hash)(ht_key k, int m);
@@ -176,12 +175,33 @@ table table_new(
     table H;
     xmalloc(H, NULL, sizeof(struct table));
     H->size = init_size;
-    H->num_elems = 0;
     H->array = A;
     H->elem_key = elem_key;
     H->equal = equal;
     H->hash = hash;
+    if (pthread_mutex_init(&(H->mutex), NULL) != 0) {
+        dprintf("mutex_init error\n");
+        xfree(H->array);
+        xfree(H);
+        return NULL;
+    }
     return H;
+}
+
+int table_lock(table H) {
+    if (pthread_mutex_lock(&(H->mutex)) != 0) {
+        dprintf("mutex_lock error\n");
+        return -1;
+    }
+    return 0;
+}
+
+int table_unlock(table H) {
+    if (pthread_mutex_unlock(&(H->mutex)) != 0) {
+        dprintf("mutex_unlock error\n");
+        return -1;
+    }
+    return 0;
 }
 
 ht_elem table_search(table H, ht_key k) {
@@ -203,7 +223,6 @@ ht_elem table_insert(table H, ht_key k, ht_elem e) {
     if (old_e != NULL) {
         return old_e;
     }
-    H->num_elems++;
     return NULL;
 }
 
@@ -211,7 +230,6 @@ void table_delete(table H, ht_key k, void (*elem_free)(ht_elem e)) {
     ht_elem e = table_search(H, k);
     int h = (*H->hash)(k, H->size);
     chain_delete(H, H->array[h], e, elem_free);
-    H->num_elems--;
 }
 
 void table_free(table H, void (*elem_free)(ht_elem e)) {
@@ -221,6 +239,9 @@ void table_free(table H, void (*elem_free)(ht_elem e)) {
         if (C != NULL) {
             chain_free(C, elem_free);
         }
+    }
+    if (pthread_mutex_destroy(&(H->mutex)) != 0) {
+        dprintf("mutex_destroy error\n");
     }
     free(H->array);
     free(H);
@@ -237,7 +258,9 @@ void table_free(table H, void (*elem_free)(ht_elem e)) {
 typedef struct bitmap_t* bitmap_t;
 struct bitmap_t {
     uint64_t* array;
+    pthread_mutex_t mutex;
     size_t arraysize;
+    size_t prev_free;
 };
 
 bitmap_t bitmap_create(size_t size) {
@@ -245,7 +268,28 @@ bitmap_t bitmap_create(size_t size) {
     xmalloc(bitmap, NULL, sizeof(struct bitmap_t));
     bitmap->arraysize = (size + sizeof(uint64_t) * 8 - 1) / (sizeof(uint64_t) * 8);
     xcalloc(bitmap->array, NULL, bitmap->arraysize, sizeof(uint64_t));
+    if (pthread_mutex_init(&(bitmap->mutex), NULL) != 0) {
+        dprintf("mutex_init error\n");
+        return NULL;
+    }
+    bitmap->prev_free = 0;
     return bitmap;
+}
+
+static inline int bitmap_lock(bitmap_t bitmap) {
+    if (pthread_mutex_lock(&(bitmap->mutex)) != 0) {
+        dprintf("mutex_lock error\n");
+        return -1;
+    }
+    return 0;
+}
+
+static inline int bitmap_unlock(bitmap_t bitmap) {
+    if (pthread_mutex_unlock(&(bitmap->mutex)) != 0) {
+        dprintf("mutex_unlock error\n");
+        return -1;
+    }
+    return 0;
 }
 
 static inline size_t bitmap_size(const bitmap_t bitmap) {
@@ -279,15 +323,27 @@ static inline bool bitmap_get(const bitmap_t bitmap, size_t i) {
 }
 
 void bitmap_free(bitmap_t bitmap) {
+    if (pthread_mutex_destroy(&(bitmap->mutex)) != 0) {
+        dprintf("mutex_destroy error\n");
+    }
     free(bitmap->array);
     free(bitmap);
 }
 
 size_t bitmap_minimum(const bitmap_t bitmap, int *found) {
-    for (size_t i = 0; i < bitmap->arraysize; i++) {
+    for (size_t i = bitmap->prev_free; i < bitmap->arraysize; i++) {
         uint64_t w = ~(bitmap->array[i]);
         if (w != 0) {
             *found = 1;
+            bitmap->prev_free = i;
+            return __builtin_ctzll(w) + i * 64;
+        }
+    }
+    for (size_t i = 0; i < bitmap->prev_free; i++) {
+        uint64_t w = ~(bitmap->array[i]);
+        if (w != 0) {
+            *found = 1;
+            bitmap->prev_free = i;
             return __builtin_ctzll(w) + i * 64;
         }
     }
@@ -300,13 +356,11 @@ typedef struct object* object;
 struct object {
     uint32_t id;
     uint32_t size;
-    uint32_t cache_index;
-    uint32_t cache_dirty;
     char key[KEY_LEN];
     uint32_t dir_ptr[DIR_PTR];
     uint32_t s_indir_ptr[S_INDIR_PTR];
     // Align the object struct to 128 bytes
-    uint64_t pad[2];
+    uint64_t pad[3];
 };
 
 static object get_object(uint32_t objid);
@@ -314,13 +368,9 @@ static int set_object(object obj);
 
 ht_key elem_key(ht_elem e) {
     object obj = get_object(*((uint32_t*)e));
-#ifdef CACHE
-    // pass the cache memory pointer
-#else
     void *key;
     xcalloc(key, NULL, KEY_LEN, sizeof(char));
     memcpy(key, (void*)(obj->key), KEY_LEN);
-#endif
     xfree(obj);
     return key;
 }
@@ -364,13 +414,131 @@ table objid_table;
 bitmap_t block_bitmap;
 bitmap_t inode_bitmap;
 
+#ifdef CACHE
+uint32_t *cache_mapping;
+uint32_t *cache_dirty;
+pthread_mutex_t *cache_mutex;
+
+static uint32_t cache_hasher(uint32_t a) {
+    a = (a + 0x7ed55d16) + (a << 12);
+    a = (a ^ 0xc761c23c) ^ (a >> 19);
+    a = (a + 0x165667b1) + (a << 5);
+    a = (a + 0xd3a2646c) ^ (a << 9);
+    a = (a + 0xfd7046c5) + (a << 3);
+    a = (a ^ 0xb55a4f09) ^ (a >> 16);
+    while (a > CACHE_MASK) {
+        a = (a >> CACHE_BIT) + (a & CACHE_MASK);
+    }
+    return a;
+}
+
+static int cache_lock(uint32_t cache_index) {
+    if (pthread_mutex_lock(&(cache_mutex[cache_index])) != 0) {
+        dprintf("mutex_lock error\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int cache_unlock(uint32_t cache_index) {
+    if (pthread_mutex_unlock(&(cache_mutex[cache_index])) != 0) {
+        dprintf("mutex_unlock error\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int write_dirty_block(uint32_t cache_index, void *buf) {
+    if (cache_dirty[cache_index] != 1) {
+        return 0;
+    }
+    if (write_block(objfs, cache_mapping[cache_index], buf) < 0) {
+        return -1;
+    }
+    cache_dirty[cache_index] = 0;
+    return 0;
+}
+
+static int read_block_cached(uint32_t blockid, void *buf) {
+    uint32_t cache_index = cache_hasher(blockid);
+    void *cache_ptr = (void*)(objfs->cache + (cache_index << 12));
+    cache_lock(cache_index);
+    if (cache_mapping[cache_index] != blockid) {
+        if (write_dirty_block(cache_index, cache_ptr) < 0) {
+            cache_unlock(cache_index);
+            return -1;
+        }
+        cache_mapping[cache_index] = blockid;
+        if (read_block(objfs, blockid, cache_ptr) < 0) {
+            cache_unlock(cache_index);
+            return -1;
+        }
+    }
+    memcpy(buf, cache_ptr, BLOCK_SIZE);
+    cache_unlock(cache_index);
+    return 0;
+}
+
+static int write_block_cached(uint32_t blockid, const void *buf) {
+    uint32_t cache_index = cache_hasher(blockid);
+    void *cache_ptr = (void*)(objfs->cache + (cache_index << 12));
+    cache_lock(cache_index);
+    if (cache_mapping[cache_index] != blockid) {
+        if (write_dirty_block(cache_index, cache_ptr) < 0) {
+            cache_unlock(cache_index);
+            return -1;
+        }
+        cache_mapping[cache_index] = blockid;
+        if (read_block(objfs, blockid, cache_ptr) < 0) {
+            cache_unlock(cache_index);
+            return -1;
+        }
+    }
+    memcpy(cache_ptr, buf, BLOCK_SIZE);
+    cache_dirty[cache_index] = 1;
+    cache_unlock(cache_index);
+    return 0;
+}
+
+static int sync_blocks() {
+    uint32_t cache_index = 0;
+    void *cache_ptr = (void*)(objfs->cache);
+    while (cache_index < MAX_CACHE_BLOCKS) {
+        if (write_dirty_block(cache_index, cache_ptr) < 0) {
+            return -1;
+        }
+        cache_ptr = cache_ptr + BLOCK_SIZE;
+        cache_index += 1;
+    }
+    return 0;
+}
+#else
+static int read_block_cached(uint32_t blockid, void *buf) {
+    if (read_block(objfs, blockid, buf) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int write_block_cached(uint32_t blockid, const void *buf) {
+    if (write_block(objfs, blockid, (void*)buf) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int sync_blocks() {
+    return 0;
+}
+#endif
+
 static object get_object(uint32_t objid) {
     // objid = x * inodes_per_block + y
     size_t x = (objid - 2) / INODES_PER_BLOCK;
     size_t y = objid - 2 - x * INODES_PER_BLOCK;
     object objs, obj;
     malloc_4k(objs, NULL);
-    if (read_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+    if (read_block_cached(x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(objs);
         return NULL;
@@ -393,13 +561,13 @@ static int set_object(object obj) {
     size_t y = obj->id - 2 - x * INODES_PER_BLOCK;
     object objs;
     malloc_4k(objs, -1);
-    if (read_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+    if (read_block_cached(x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(objs);
         return -1;
     }
     memcpy((void*)(objs + y), (void*)obj, OBJECT_SIZE);
-    if (write_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+    if (write_block_cached(x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: write_block returned null\n", __func__);
         free_4k(objs);
         return -1;
@@ -412,13 +580,25 @@ static int invalidate_block(uint32_t blockid) {
     if (blockid < DATA_START_BLOCK) {
         return -1;
     }
+    bitmap_lock(block_bitmap);
     if (bitmap_get(block_bitmap, blockid - DATA_START_BLOCK) == false) {
+        bitmap_unlock(block_bitmap);
         return -1;
     }
+    bitmap_unlock(block_bitmap);
 #ifdef CACHE
     // remove it from the cache if present
+    uint32_t cache_index = cache_hasher(blockid);
+    cache_lock(cache_index);
+    if (cache_mapping[cache_index] == blockid) {
+        cache_mapping[cache_index] = 0;
+        cache_dirty[cache_index] = 0;
+    }
+    cache_unlock(cache_index);
 #endif
+    bitmap_lock(block_bitmap);
     bitmap_clear(block_bitmap, blockid - DATA_START_BLOCK);
+    bitmap_unlock(block_bitmap);
     return 0;
 }
 
@@ -428,7 +608,7 @@ static int invalidate_indirect_block(uint32_t blockid) {
     }
     uint32_t *block;
     malloc_4k(block, -1);
-    if (read_block(objfs, blockid, (void*)block) < 0) {
+    if (read_block_cached(blockid, (void*)block) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         return -1;
     }
@@ -457,36 +637,39 @@ static int free_object(object obj) {
     size_t y = objid - 2 - x * INODES_PER_BLOCK;
     object objs;
     malloc_4k(objs, -1);
-    if (read_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+    if (read_block_cached(x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(objs);
         return -1;
     }
     memcpy((void*)(objs + y), (void*)obj, OBJECT_SIZE);
-    if (write_block(objfs, x + INODE_START_BLOCK, (void*)objs) < 0) {
+    if (write_block_cached(x + INODE_START_BLOCK, (void*)objs) < 0) {
         dprintf("%s: write_block returned null\n", __func__);
         free_4k(objs);
         return -1;
     }
     free_4k(objs);
-    return obj->id;
+    return 0;
 }
 
 static int write_direct_data_block(object obj, size_t ind, const char *buf, size_t size) {
     int found = 0;
+    bitmap_lock(block_bitmap);
     size_t bit_index = bitmap_minimum(block_bitmap, &found);
     if (found == 0) {
+        bitmap_unlock(block_bitmap);
         dprintf("%s: objstore is full\n", __func__);
         return -1;
     }
     bitmap_set(block_bitmap, bit_index);
+    bitmap_unlock(block_bitmap);
     size_t block = bit_index + DATA_START_BLOCK;
     obj->dir_ptr[ind] = block;
 
     void *ptr;
     malloc_4k(ptr, -1);
     memcpy(ptr, (void*)buf, size);
-    if (write_block(objfs, block, (void*)ptr) < 0) {
+    if (write_block_cached(block, (void*)ptr) < 0) {
         dprintf("%s: write_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
@@ -501,46 +684,63 @@ static int write_indirect_direct_data_block(object obj, size_t ind, const char *
     if (indir_ind >= S_INDIR_PTR) {
         return -1;
     }
-    if (obj->s_indir_ptr[indir_ind] < DATA_START_BLOCK || (bitmap_get(block_bitmap, obj->s_indir_ptr[indir_ind] - DATA_START_BLOCK) == false)) {
+    if (obj->s_indir_ptr[indir_ind] < DATA_START_BLOCK) {
         int found = 0;
+        bitmap_lock(block_bitmap);
         size_t bit_index = bitmap_minimum(block_bitmap, &found);
         if (found == 0) {
+            bitmap_unlock(block_bitmap);
             dprintf("%s: objstore is full\n", __func__);
             return -1;
         }
         bitmap_set(block_bitmap, bit_index);
+        bitmap_unlock(block_bitmap);
         size_t block = bit_index + DATA_START_BLOCK;
         obj->s_indir_ptr[indir_ind] = block;
         dprintf("%s: %ld\n", __func__, block);
+        void *ptr;
+        malloc_4k(ptr, -1);
+        for (size_t i = 0; i < BLOCK_SIZE; i++) {
+            *((char*)ptr + i) = 0;
+        }
+        if (write_block_cached(block, ptr) < 0) {
+            dprintf("%s: write_block returned null\n", __func__);
+            free_4k(ptr);
+            return -1;
+        }
+        free_4k(ptr);
     }
 
     size_t blockid = obj->s_indir_ptr[indir_ind];
     uint32_t *ptr;
     malloc_4k(ptr, -1);
-    if (read_block(objfs, blockid, (void*)ptr) < 0) {
+    if (read_block_cached(blockid, (void*)ptr) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
     }
 
     int found = 0;
+    bitmap_lock(block_bitmap);
     size_t bit_index = bitmap_minimum(block_bitmap, &found);
     if (found == 0) {
+        bitmap_unlock(block_bitmap);
         dprintf("%s: objstore is full\n", __func__);
         free_4k(ptr);
         return -1;
     }
     bitmap_set(block_bitmap, bit_index);
+    bitmap_unlock(block_bitmap);
     size_t block = bit_index + DATA_START_BLOCK;
     ptr[indir_off] = block;
-    if (write_block(objfs, blockid, (void*)ptr) < 0) {
+    if (write_block_cached(blockid, (void*)ptr) < 0) {
         dprintf("%s: write_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
     }
 
     memcpy((void*)ptr, (void*)buf, size);
-    if (write_block(objfs, block, (void*)ptr) < 0) {
+    if (write_block_cached(block, (void*)ptr) < 0) {
         dprintf("%s: write_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
@@ -554,7 +754,7 @@ static int read_direct_data_block(object obj, size_t ind, const char *buf, size_
     size_t block = obj->dir_ptr[ind];
     void *ptr;
     malloc_4k(ptr, -1);
-    if (read_block(objfs, block, (void*)ptr) < 0) {
+    if (read_block_cached(block, (void*)ptr) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
@@ -574,13 +774,13 @@ static int read_indirect_data_block(object obj, size_t ind, const char *buf, siz
     dprintf("%s: %ld\n", __func__, block);
     uint32_t *ptr;
     malloc_4k(ptr, -1);
-    if (read_block(objfs, block, (void*)ptr) < 0) {
+    if (read_block_cached(block, (void*)ptr) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
     }
     block = ptr[indir_off];
-    if (read_block(objfs, block, (void*)ptr) < 0) {
+    if (read_block_cached(block, (void*)ptr) < 0) {
         dprintf("%s: read_block returned null\n", __func__);
         free_4k(ptr);
         return -1;
@@ -635,7 +835,7 @@ static int init_hash_table() {
     malloc_4k(objs, -1);
     objid_table = table_new(MAX_OBJS, &elem_key, &equal, &hash);
     for (size_t i = INODE_START_BLOCK; i < DATA_START_BLOCK; i++) {
-        if (read_block(objfs, i, (void*)objs) < 0) {
+        if (read_block_cached(i, (void*)objs) < 0) {
             free_4k(objs);
             return -1;
         }
@@ -658,6 +858,7 @@ static int init_hash_table() {
 }
 
 static void destroy_hash_table() {
+    sync_blocks();
     table_free(objid_table, &elem_free);
     return;
 }
@@ -665,12 +866,15 @@ static void destroy_hash_table() {
 // Returns the object ID.  -1 (invalid), 0, 1 - reserved
 long find_object_id(const char *key, objfs_state objfs_local) {
     objfs = objfs_local;
+    table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)key);
     if (ptr == NULL || *((uint32_t*)ptr) < 2) {
+        table_unlock(objid_table);
         return -1;
     }
-    object obj = get_object(*((uint32_t*)ptr));
-    uint32_t objid = obj->id;
+    uint32_t objid = *((uint32_t*)ptr);
+    table_unlock(objid_table);
+    object obj = get_object(objid);
     xfree(obj);
     return objid;
 }
@@ -682,22 +886,32 @@ long find_object_id(const char *key, objfs_state objfs_local) {
 long create_object(const char *key, objfs_state objfs_local) {
     objfs = objfs_local;
     // Check duplicates
+    table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)key);
     if (ptr != NULL) {
+        table_unlock(objid_table);
         return -1;
     }
-    // @require: atomicity
     int found = 0;
+    bitmap_lock(inode_bitmap);
     size_t bit_index = bitmap_minimum(inode_bitmap, &found);
     if (found == 0) {
+        bitmap_unlock(inode_bitmap);
+        table_unlock(objid_table);
         dprintf("%s: objstore is full\n", __func__);
         return -1;
     }
     bitmap_set(inode_bitmap, bit_index);
-    // @end: atomicity
+    bitmap_unlock(inode_bitmap);
+    uint32_t *id;
+    xmalloc(id, -1, sizeof(uint32_t));
+    *id = bit_index + 2;
+    table_insert(objid_table, (void*)key, id);
+    table_unlock(objid_table);
+
     object obj;
     xcalloc(obj, -1, 1, sizeof(struct object));
-    obj->id = bit_index + 2;
+    obj->id = *id;
     obj->size = 0;
     for (size_t i = 0; i < DIR_PTR; i++) {
         obj->dir_ptr[i] = 0;
@@ -705,18 +919,11 @@ long create_object(const char *key, objfs_state objfs_local) {
     for (size_t i = 0; i < S_INDIR_PTR; i++) {
         obj->s_indir_ptr[i] = 0;
     }
-    #ifdef CACHE
-    // do caching init
-    #endif
     memcpy(obj->key, key, KEY_LEN);
     if (set_object(obj) != obj->id) {
         free(obj);
         return -1;
     }
-    uint32_t *id;
-    xmalloc(id, -1, sizeof(uint32_t));
-    *id = obj->id;
-    table_insert(objid_table, (void*)(obj->key), id);
     free(obj);
     return bit_index + 2;
 }
@@ -727,14 +934,8 @@ long create_object(const char *key, objfs_state objfs_local) {
 //               Failure --> -1
 long release_object(int objid, objfs_state objfs_local) {
     objfs = objfs_local;
-    if (objid < 2) {
-        return -1;
-    }
-    object obj = get_object(objid);
-    if (obj->id != objid) {
-        return -1;
-    }
-    // TODO
+    // I don't think this is of any use as of now. Hence, no need to implement it.
+    // Maybe useful in cache eviction policies that are not deterministic.
     return 0;
 }
 
@@ -743,19 +944,25 @@ long release_object(int objid, objfs_state objfs_local) {
 //               Failure --> -1
 long destroy_object(const char *key, objfs_state objfs_local) {
     objfs = objfs_local;
+    table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)key);
     if (ptr == NULL || *((uint32_t*)ptr) < 2) {
+        table_unlock(objid_table);
         return -1;
     }
     uint32_t objid = *((uint32_t*)ptr);
     table_delete(objid_table, (void*)key, &elem_free);
+    table_unlock(objid_table);
     object obj = get_object(objid);
+    dprintf("%s: freeing the object with objid = %d\n", __func__, obj->id);
     if (free_object(obj) < 0) {
         xfree(obj);
         return -1;
     }
     xfree(obj);
+    bitmap_lock(inode_bitmap);
     bitmap_clear(inode_bitmap, objid - 2);
+    bitmap_unlock(inode_bitmap);
     return 0;
 }
 
@@ -765,22 +972,26 @@ long destroy_object(const char *key, objfs_state objfs_local) {
 //               Failure --> -1
 long rename_object(const char *key, const char *newname, objfs_state objfs_local) {
     objfs = objfs_local;
+    table_lock(objid_table);
     void *ptr = table_search(objid_table, (void*)newname);
     if (ptr != NULL) {
+        table_unlock(objid_table);
         return -1;
     }
     ptr = table_search(objid_table, (void*)key);
     if (ptr == NULL || *((uint32_t*)ptr) < 2) {
+        table_unlock(objid_table);
         return -1;
     }
     uint32_t objid = *((uint32_t*)ptr);
     table_delete(objid_table, (void*)key, &elem_free);
-    object obj = get_object(objid);
-    memcpy((void*)(obj->key), (void*)newname, KEY_LEN);
     uint32_t *id;
     xmalloc(id, -1, sizeof(uint32_t));
-    *id = obj->id;
-    table_insert(objid_table, (void*)obj->key, id);
+    *id = objid;
+    table_insert(objid_table, (void*)newname, id);
+    table_unlock(objid_table);
+    object obj = get_object(objid);
+    memcpy((void*)(obj->key), (void*)newname, KEY_LEN);
     if (set_object(obj) != obj->id) {
         free(obj);
         return -1;
@@ -892,6 +1103,17 @@ int objstore_init(objfs_state objfs_local) {
     if (init_bitmap(&block_bitmap, MAX_OBJS / (8 * BLOCK_SIZE), MAX_BLOCKS) < 0) {
         return -1;
     }
+    // cache_mapping from MAX_CACHE_BLOCKS to blockid this index represents.
+    // block 0 is never hashed and hence is the default value.
+    xcalloc(cache_mapping, -1, MAX_CACHE_BLOCKS, sizeof(uint32_t));
+    xcalloc(cache_dirty, -1, MAX_CACHE_BLOCKS, sizeof(uint32_t));
+    xmalloc(cache_mutex, -1, MAX_CACHE_BLOCKS * sizeof(pthread_mutex_t));
+    for (size_t i = 0; i < MAX_CACHE_BLOCKS; i++) {
+        if (pthread_mutex_init(&(cache_mutex[i]), NULL) != 0) {
+            dprintf("mutex_init error\n");
+            return -1;
+        }
+    }
     if (init_hash_table() < 0) {
         return -1;
     }
@@ -909,6 +1131,15 @@ int objstore_destroy(objfs_state objfs_local) {
         return -1;
     }
     destroy_hash_table();
+    free(cache_mapping);
+    free(cache_dirty);
+    for (size_t i = 0; i < MAX_CACHE_BLOCKS; i++) {
+        if (pthread_mutex_destroy(&(cache_mutex[i])) != 0) {
+            dprintf("mutex_destroy error\n");
+            return -1;
+        }
+    }
+    free(cache_mutex);
     dprintf("Objstore destroy completed successfully!\n");
     return 0;
 }

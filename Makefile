@@ -1,7 +1,7 @@
 all:objfs
 CC = gcc
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -DDBG -DFUSE_USE_VERSION=26 -D_GNU_SOURCE -g -Wall
-LDFLAGS = -pthread -lfuse
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -DDBG -DFUSE_USE_VERSION=26 -D_GNU_SOURCE -g -Wall -DCACHE
+LDFLAGS = -lpthread -lfuse
 OBJS = objfs.o lib.o objstore.o
 
 %.o : %.c
