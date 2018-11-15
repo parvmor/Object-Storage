@@ -909,8 +909,6 @@ long create_object(const char *key, objfs_state objfs_local) {
     uint32_t *id;
     xmalloc(id, -1, sizeof(uint32_t));
     *id = bit_index + 2;
-    table_insert(objid_table, (void*)key, id);
-    table_unlock(objid_table);
 
     object obj;
     xcalloc(obj, -1, 1, sizeof(struct object));
@@ -924,9 +922,14 @@ long create_object(const char *key, objfs_state objfs_local) {
     }
     memcpy(obj->key, key, KEY_LEN);
     if (set_object(obj) != obj->id) {
+        table_unlock(objid_table);
         free(obj);
         return -1;
     }
+
+    table_insert(objid_table, (void*)key, id);
+    table_unlock(objid_table);
+    dprintf("%s: %d\n", __func__, obj->id);
     free(obj);
     return bit_index + 2;
 }

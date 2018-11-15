@@ -30,13 +30,13 @@ int objfs_getattr(const char *key, struct stat *statbuf)
     }else{
            *statbuf = objfs->def_fstat;
            retval = find_object_id(key+1, objfs);
-           dprintf("%s: Hello %d %s\n", __func__, retval, key+1);
+           dprintf("%s: %d %s\n", __func__, retval, key+1);
            if(retval < 0)
                  return -ENOENT;
            statbuf->st_ino = retval;
            if(fillup_size_details(statbuf, objfs) < 0)
                 return -EBADF;
-           dprintf("%s: Hello %d %s\n", __func__, retval, key+1);
+           dprintf("%s: %d %s\n", __func__, retval, key+1);
     }
     statbuf->st_uid = getuid();
     statbuf->st_gid = getgid();
@@ -141,7 +141,7 @@ int objfs_release(const char *key, struct fuse_file_info *fi)
 {
     dprintf("%s: key=%s\n", __func__, key);
     release_object(fi->fh, objfs);
-    dprintf("Hello %s: key=%s\n", __func__, key);
+    dprintf("%s: key=%s\n", __func__, key);
     return -EINVAL;
 }
 
