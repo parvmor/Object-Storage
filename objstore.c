@@ -39,6 +39,7 @@
 #define MAX_CACHE_BLOCKS ((CACHE_SIZE) / (BLOCK_SIZE))
 #define CACHE_MASK ((1<<15) - 1)
 #define CACHE_BIT (15)
+#define INODE_TABLE_SIZE (DATA_START_BLOCK - INODE_START_BLOCK)
 
 #define min(a, b) (((a) > (b)) ? (b) : (a))
 #define max(a, b) (((b) > (a)) ? (b) : (a))
@@ -355,6 +356,8 @@ struct object {
 
 static object get_object(uint32_t objid);
 static int set_object(object obj);
+static int object_lock(uint32_t objid);
+static int object_unlock(uint32_t objid);
 
 ht_key elem_key(ht_elem e) {
     object obj = get_object(*((uint32_t*)e));
@@ -403,6 +406,7 @@ void elem_free(ht_elem e) {
 table objid_table;
 bitmap_t block_bitmap;
 bitmap_t inode_bitmap;
+pthread_mutex_t *inode_mutex;
 
 #ifdef CACHE
 uint32_t *cache_mapping;
@@ -519,6 +523,22 @@ static int sync_blocks() {
     return 0;
 }
 #endif
+
+static int object_lock(uint32_t objid) {
+    size_t x = (objid - 2) / INODES_PER_BLOCK;
+    if (pthread_mutex_lock(&(inode_mutex[x])) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int object_unlock(uint32_t objid) {
+    size_t x = (objid - 2) / INODES_PER_BLOCK;
+    if (pthread_mutex_unlock(&(inode_mutex[x])) != 0) {
+        return -1;
+    }
+    return 0;
+}
 
 static object get_object(uint32_t objid) {
     // objid = x * inodes_per_block + y
@@ -842,8 +862,6 @@ long find_object_id(const char *key, objfs_state objfs_local) {
     }
     uint32_t objid = *((uint32_t*)ptr);
     table_unlock(objid_table);
-    object obj = get_object(objid);
-    xfree(obj);
     return objid;
 }
 
@@ -871,13 +889,10 @@ long create_object(const char *key, objfs_state objfs_local) {
     }
     bitmap_set(inode_bitmap, bit_index);
     bitmap_unlock(inode_bitmap);
-    uint32_t *id;
-    xmalloc(id, -1, sizeof(uint32_t));
-    *id = bit_index + 2;
 
     object obj;
     xcalloc(obj, -1, 1, sizeof(struct object));
-    obj->id = *id;
+    obj->id = bit_index + 2;
     obj->size = 0;
     for (size_t i = 0; i < DIR_PTR; i++) {
         obj->dir_ptr[i] = 0;
@@ -886,12 +901,18 @@ long create_object(const char *key, objfs_state objfs_local) {
         obj->s_indir_ptr[i] = 0;
     }
     memcpy(obj->key, key, KEY_LEN);
+    object_lock(obj->id);
     if (set_object(obj) != obj->id) {
+        object_unlock(obj->id);
         table_unlock(objid_table);
         free(obj);
         return -1;
     }
+    object_unlock(obj->id);
 
+    uint32_t *id;
+    xmalloc(id, -1, sizeof(uint32_t));
+    *id = obj->id;
     table_insert(objid_table, (void*)key, id);
     table_unlock(objid_table);
     free(obj);
@@ -925,11 +946,14 @@ long destroy_object(const char *key, objfs_state objfs_local) {
     uint32_t objid = *((uint32_t*)ptr);
     table_delete(objid_table, (void*)key, &elem_free);
     table_unlock(objid_table);
+    object_lock(objid);
     object obj = get_object(objid);
     if (free_object(obj) < 0) {
+        object_unlock(objid);
         xfree(obj);
         return -1;
     }
+    object_unlock(objid);
     xfree(obj);
     bitmap_lock(inode_bitmap);
     bitmap_clear(inode_bitmap, objid - 2);
@@ -962,12 +986,15 @@ long rename_object(const char *key, const char *newname, objfs_state objfs_local
     *id = objid;
     table_insert(objid_table, (void*)newname, id);
     table_unlock(objid_table);
+    object_lock(objid);
     object obj = get_object(objid);
     memcpy((void*)(obj->key), (void*)newname, KEY_LEN);
     if (set_object(obj) != obj->id) {
+        object_unlock(objid);
         free(obj);
         return -1;
     }
+    object_unlock(objid);
     free(obj);
     return objid;
 }
@@ -981,11 +1008,12 @@ long objstore_write(int objid, const char *buf, int size, objfs_state objfs_loca
     if (objid < 2) {
         return -1;
     }
-    object obj = get_object(objid);
     // offset is 4K aligned.
     if (((offset >> 12) << 12) != offset) {
         return -1;
     }
+    object_lock(objid);
+    object obj = get_object(objid);
     for (size_t i = 0; i < size; i += BLOCK_SIZE) {
         size_t ind = (i + offset) / BLOCK_SIZE;
         int ret;
@@ -997,14 +1025,18 @@ long objstore_write(int objid, const char *buf, int size, objfs_state objfs_loca
             ret = write_indirect_direct_data_block(obj, ind, buf + i, min(size - i, BLOCK_SIZE));
         }
         if (ret < 0) {
+            object_unlock(objid);
             xfree(obj);
             return -1;
         }
     }
     obj->size += size;
     if (set_object(obj) != obj->id) {
+        object_unlock(objid);
         return -1;
     }
+    object_unlock(objid);
+    dprintf("%d, %s: %d %d %d\n", __LINE__, __func__, obj->id, size, obj->size);
     xfree(obj);
     return size;
 }
@@ -1018,10 +1050,10 @@ long objstore_read(int objid, char *buf, int size, objfs_state objfs_local, off_
     if (objid < 2) {
         return -1;
     }
-    object obj = get_object(objid);
     if (((offset >> 12) << 12) != offset) {
         return -1;
     }
+    object obj = get_object(objid);
     for (size_t i = 0; i < size; i += BLOCK_SIZE) {
         size_t ind = (i + offset) / BLOCK_SIZE;
         int ret;
@@ -1091,11 +1123,19 @@ int objstore_init(objfs_state objfs_local) {
         }
     }
     #endif
+    xmalloc(inode_mutex, -1, INODE_TABLE_SIZE * sizeof(pthread_mutex_t));
+    for (size_t i = 0; i < INODE_TABLE_SIZE; i++) {
+        if (pthread_mutex_init(&(inode_mutex[i]), NULL) != 0) {
+            global = 0;
+            return -1;
+        }
+    }
     if (init_hash_table() < 0) {
         global = 0;
         return -1;
     }
     global = 0;
+    dprintf("objstore_init finish\n");
     return 0;
 }
 
@@ -1123,6 +1163,14 @@ int objstore_destroy(objfs_state objfs_local) {
     }
     free(cache_mutex);
     #endif
+    for (size_t i = 0; i < INODE_TABLE_SIZE; i++) {
+        if (pthread_mutex_destroy(&(inode_mutex[i])) != 0) {
+            global = 0;
+            return -1;
+        }
+    }
+    free(inode_mutex);
     global = 0;
+    dprintf("objstore_destroy finish\n");
     return 0;
 }

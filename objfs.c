@@ -22,7 +22,6 @@ static struct objfs_state *objfs;
 int objfs_getattr(const char *key, struct stat *statbuf)
 {
     int retval;
-    dprintf("%s: key=%s\n", __func__, key);
 
     if(!strcmp(key, "/")){
            *statbuf = objfs->def_dirstat;
@@ -30,13 +29,12 @@ int objfs_getattr(const char *key, struct stat *statbuf)
     }else{
            *statbuf = objfs->def_fstat;
            retval = find_object_id(key+1, objfs);
-           dprintf("%s: %d %s\n", __func__, retval, key+1);
+           dprintf("%s: %d %s\n", __func__, retval, key + 1);
            if(retval < 0)
                  return -ENOENT;
            statbuf->st_ino = retval;
            if(fillup_size_details(statbuf, objfs) < 0)
                 return -EBADF;
-           dprintf("%s: %d %s\n", __func__, retval, key+1);
     }
     statbuf->st_uid = getuid();
     statbuf->st_gid = getgid();
