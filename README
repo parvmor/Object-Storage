@@ -29,3 +29,8 @@ Go inside the test directory and see the README.
 UNMOUNT
 -------
 fusermount -u mnt
+
+NOTE
+----
+
+For the assignment only `objstore.c` was written by me.
